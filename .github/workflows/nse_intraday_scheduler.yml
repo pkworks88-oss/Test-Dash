@@ -2,9 +2,7 @@ name: NSE Intraday ₹1L Auto Trader
 
 on:
   schedule:
-    # Every 5 mins during NSE hours (09:20 AM - 03:20 PM IST -> 03:50 - 09:50 UTC, Mon-Fri)
     - cron: '*/5 4-9 * * 1-5'
-    # Explicit 03:15 PM IST (09:45 UTC) Forced EOD Square-Off
     - cron: '45 9 * * 1-5'
   workflow_dispatch:
 
