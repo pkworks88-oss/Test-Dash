@@ -61,15 +61,12 @@ def init_or_load_ledger(client, today_str: str):
     trades_ws = sh.worksheet("trades")
     msg_ws = sh.worksheet("agent_messages")
 
-    # account tab layout:
-    # A1: cash_balance | B1: active_date | C1: peak_daily_pnl | D1: locked_floor
     row_vals = acc_ws.row_values(2)
     cash_balance = float(row_vals[0]) if len(row_vals) >= 1 and row_vals[0] else INITIAL_CAPITAL
     stored_date = row_vals[1] if len(row_vals) >= 2 else ""
     peak_daily_pnl = float(row_vals[2]) if len(row_vals) >= 3 and row_vals[2] else 0.0
     locked_floor = float(row_vals[3]) if len(row_vals) >= 4 and row_vals[3] else 0.0
 
-    # Reset daily peak & profit floor on a new trading day
     if stored_date != today_str:
         peak_daily_pnl = 0.0
         locked_floor = 0.0
@@ -225,7 +222,6 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
     metrics_df = fetch_intraday_metrics(LIQUID_INTRADAY_UNIVERSE)
     ltp_map = dict(zip(metrics_df["symbol"], metrics_df["ltp"])) if not metrics_df.empty else {}
 
-    # 1. Calculate Today's Realized & Live Unrealized MTM P&L
     today_realized_pnl = 0.0
     if not trades_df.empty:
         if "date" not in trades_df.columns:
@@ -252,7 +248,6 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
 
     total_today_pnl = round(today_realized_pnl + live_unrealized_pnl, 2)
 
-    # 2. Update Peak Daily P&L & Trailing Profit Floor (>= ₹2,000 once crossed)
     if total_today_pnl > peak_daily_pnl:
         peak_daily_pnl = total_today_pnl
 
@@ -261,7 +256,6 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
         computed_floor = round(MIN_DAILY_PROFIT_FLOOR + (excess_above_2k * TRAIL_RETENTION_RATIO), 2)
         locked_floor = max(locked_floor, computed_floor)
 
-    # 3. Check Portfolio-Wide Exit Triggers (EOD, Trailing Floor Hit, or Daily Max Loss)
     is_eod = current_ist.time() >= EOD_SQUAREOFF_TIME or force_square_off
     floor_breached = (locked_floor >= MIN_DAILY_PROFIT_FLOOR) and (total_today_pnl <= locked_floor)
     daily_loss_breached = total_today_pnl <= DAILY_MAX_LOSS
@@ -274,7 +268,6 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
         sl = float(row["sl"])
         target = float(row["target"])
 
-        # Once ₹2,000 floor is active, automatically trail individual trade SL to at least breakeven if profitable
         effective_sl = max(sl, round(entry * 1.001, 2)) if (locked_floor >= MIN_DAILY_PROFIT_FLOOR and cur_ltp > entry * 1.003) else sl
 
         exit_reason = None
@@ -304,13 +297,11 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
                           f"Closed {sym} ({exit_reason}) @ ₹{exit_px} | Net P&L: ₹{final_pnl} | Floor: ₹{locked_floor}", row)
         else:
             open_symbols.add(sym)
-            # Update tightened SL in sheet if trailed
             if effective_sl > sl:
                 trades_ws.update_cell(idx, 8, effective_sl)
 
     sync_account_state(acc_ws, cash_balance, today_str, peak_daily_pnl, locked_floor)
 
-    # 4. Halt New Entries if Daily Floor Was Breached, Max Loss Hit, or Past 02:30 PM IST
     if floor_breached:
         log_agent_msg(msg_ws, cycle_id, "RISK_GUARD", "ALL", "FLOOR_SECURED",
                       f"Trailing profit floor ₹{locked_floor:.2f} triggered! Day locked at ₹{today_realized_pnl:.2f}.", {})
@@ -325,7 +316,6 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
     if metrics_df.empty or len(open_symbols) >= MAX_CONCURRENT_TRADES:
         return {"status": "ACTIVE_POSITIONS_RUNNING", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
 
-    # 5. Quantitative Momentum Funnel (AG1, AG2, AG3)
     avail_df = metrics_df[~metrics_df["symbol"].isin(open_symbols)].copy()
     ag1_df = avail_df[(avail_df["ltp"] > avail_df["vwap"]) & (avail_df["ema9"] > avail_df["ema20"]) & (avail_df["rsi14"].between(50, 66))].sort_values("rvol", ascending=False).head(2)
     ag2_df = avail_df[(avail_df["ltp"] > avail_df["vwap"]) & (avail_df["day_chg_pct"].between(0.8, 3.2)) & (avail_df["rsi14"].between(55, 72))].sort_values("rvol", ascending=False).head(2)
@@ -355,12 +345,8 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
     if not committee_payload:
         return {"status": "NO_SETUPS", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
 
-    # 6. AG4 Chief Analyst Approval
     decision_out = await run_gemini_committee(gemini_api_key, committee_payload, total_today_pnl, locked_floor)
 
-    # 7. AG5 House-Money Position Sizing
-    # Before ₹2,000 floor: risk max ₹550 per trade to build base.
-    # After ₹2,000 floor: risk ONLY 50% of the excess profit above ₹2,000 so the ₹2,000 minimum floor is never endangered.
     if locked_floor >= MIN_DAILY_PROFIT_FLOOR:
         excess_cushion = max(0.0, total_today_pnl - locked_floor)
         max_trade_risk_rupees = excess_cushion * 0.50
