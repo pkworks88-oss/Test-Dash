@@ -6,8 +6,12 @@ import pandas as pd
 import yfinance as yf
 import plotly.graph_objects as go
 from engine import (
-    run_full_cycle, get_gsheet_client, now_ist,
-    INITIAL_CAPITAL, DAILY_PROFIT_TARGET, DAILY_MAX_LOSS, SHEET_NAME
+    run_full_cycle,
+    get_gsheet_client,
+    now_ist,
+    INITIAL_CAPITAL,
+    MIN_DAILY_PROFIT_FLOOR,
+    SHEET_NAME,
 )
 
 st.set_page_config(page_title="NSE ₹1L Intraday 5-Agent Terminal", layout="wide")
@@ -15,7 +19,6 @@ st.set_page_config(page_title="NSE ₹1L Intraday 5-Agent Terminal", layout="wid
 st.markdown("""
 <style>
 .stApp { background-color: #070d19; color: #e2e8f0; }
-.metric-card { background: #0f1c36; border: 1px solid #1e3a5f; border-radius: 10px; padding: 14px; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -27,9 +30,9 @@ current_ist = now_ist()
 today_str = current_ist.strftime("%Y-%m-%d")
 
 st.title("⚡ NSE ₹1,00,000 Intraday 5-Agent Trading Terminal")
-st.caption(f"IST Time: {current_ist.strftime('%Y-%m-%d %H:%M:%S')} | Daily Target: +₹2,000 | EOD Square-Off: 03:15 PM IST")
+st.caption(f"IST Time: {current_ist.strftime('%Y-%m-%d %H:%M:%S')} | Min Floor: +₹2,000 (Trailing 75% Ratchet) | EOD Square-Off: 03:15 PM IST")
 
-col1, col2, col3 = st.columns([1, 1, 2])
+col1, col2 = st.columns([1, 1])
 with col1:
     if st.button("▶ Run Intraday Cycle Now", use_container_width=True):
         with st.spinner("Scanning intraday VWAP/RVOL & running Gemini committee..."):
@@ -41,10 +44,13 @@ with col2:
             res = asyncio.run(run_full_cycle(gemini_key, gcp_json, force_square_off=True))
             st.warning(f"Square-Off Executed: {res}")
 
-# Load Ledger Data
 gc = get_gsheet_client(gcp_json)
 sh = gc.open(SHEET_NAME)
-cash_balance = float(sh.worksheet("account").acell("A2").value or INITIAL_CAPITAL)
+acc_vals = sh.worksheet("account").row_values(2)
+cash_balance = float(acc_vals[0]) if len(acc_vals) >= 1 and acc_vals[0] else INITIAL_CAPITAL
+peak_pnl = float(acc_vals[2]) if len(acc_vals) >= 3 and acc_vals[2] else 0.0
+locked_floor = float(acc_vals[3]) if len(acc_vals) >= 4 and acc_vals[3] else 0.0
+
 trades_df = pd.DataFrame(sh.worksheet("trades").get_all_records())
 msgs_df = pd.DataFrame(sh.worksheet("agent_messages").get_all_records())
 
@@ -57,24 +63,24 @@ if not trades_df.empty:
     today_realized = float(closed_today["pnl"].astype(float).sum()) if not closed_today.empty else 0.0
     open_trades = trades_df[trades_df["status"] == "OPEN"]
 
-# KPI Strip
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Account Capital", f"₹{cash_balance:,.2f}", f"{cash_balance - INITIAL_CAPITAL:+,.2f}")
-m2.metric("Today's Realized P&L", f"₹{today_realized:,.2f}", f"Target: ₹{DAILY_PROFIT_TARGET:,.0f}")
-m3.metric("Target Progress", f"{min(100.0, max(0.0, (today_realized / DAILY_PROFIT_TARGET) * 100)):.1f}%")
-m4.metric("Open Intraday Positions", f"{len(open_trades)} / 2")
+m2.metric("Today's Realized P&L", f"₹{today_realized:,.2f}", f"Peak: ₹{peak_pnl:,.2f}")
+m3.metric("Active Profit Floor", f"₹{locked_floor:,.2f}", "LOCKED >= ₹2K" if locked_floor >= MIN_DAILY_PROFIT_FLOOR else "Building Base")
+m4.metric("Open Positions", f"{len(open_trades)} / 3")
 
-st.progress(min(1.0, max(0.0, today_realized / DAILY_PROFIT_TARGET)))
+st.progress(min(1.0, max(0.0, today_realized / MIN_DAILY_PROFIT_FLOOR)))
 
 tab1, tab2, tab3 = st.tabs(["📊 Open Positions & Intraday Chart", "📜 Trade Ledger", "🤖 5-Agent Comms"])
 
 with tab1:
     if not open_trades.empty:
-        st.subheader("Active Intraday Holdings")
         st.dataframe(open_trades, use_container_width=True)
         sel_sym = st.selectbox("Inspect 5-Minute Intraday Chart", open_trades["symbol"].tolist())
         hist = yf.download(sel_sym, period="1d", interval="5m", progress=False)
         if not hist.empty:
+            if isinstance(hist.columns, pd.MultiIndex):
+                hist.columns = hist.columns.get_level_values(0)
             row = open_trades[open_trades["symbol"] == sel_sym].iloc[0]
             fig = go.Figure(data=[go.Candlestick(
                 x=hist.index, open=hist["Open"], high=hist["High"], low=hist["Low"], close=hist["Close"]
