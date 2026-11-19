@@ -236,7 +236,6 @@ def fetch_index_fno_context(session=None, current_ist: datetime = None) -> dict:
             pcr = nse_chain.get("pcr", round(1.0 + ((spot - ema20) / max(spot, 1)) * 15, 2))
             chain_source = nse_chain.get("source", "BS_VIX_CALIBRATED")
 
-            # Build 11-strike chain (-5 to +5 steps around ATM) for UI Option Chain Matrix
             live_strikes_map = {}
             for item in nse_chain.get("data", []):
                 st_px = item.get("strikePrice")
@@ -273,7 +272,6 @@ def fetch_index_fno_context(session=None, current_ist: datetime = None) -> dict:
             otm_ce_ltp, _, _, _ = bs_option_metrics(spot, otm_ce_strike, dte_days, iv_decimal, "CE")
             otm_pe_ltp, _, _, _ = bs_option_metrics(spot, otm_pe_strike, dte_days, iv_decimal, "PE")
 
-            # Override ATM / OTM with exact chain row values
             for crow in chain_table:
                 if crow["Strike"] == atm_strike:
                     ce_ltp, pe_ltp = crow["CE_LTP"], crow["PE_LTP"]
@@ -413,7 +411,6 @@ async def run_unified_gemini_committee(
 ) -> tuple[UnifiedCommitteeOutput, str]:
     client = genai.Client(api_key=api_key)
 
-    # Strip bulky chain_table before sending to LLM so context stays crisp
     slim_fno = {k: v for k, v in fno_context.items() if k != "live_option_ltps"}
     if "indices" in slim_fno:
         slim_fno["indices"] = {
@@ -437,10 +434,10 @@ async def run_unified_gemini_committee(
 
     Rules:
     1. For Book A (Equity): Approve up to 2 highest-conviction BUY setups (R:R >= 1:1.6, conviction >= 60). Veto NEGATIVE_RISK news or RSI > 78.
-    2. For Book B (Index F&O): Approve up to 2 NIFTY or BANKNIFTY setups (conviction >= 65).
-       - If spot > ema9 > ema20 and RSI 50-72: select Bullish CE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bull_call_spread).
-       - If spot < ema9 < ema20 and RSI 28-50: select Bearish PE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bear_put_spread).
-       - Set entry_premium = exact ltp/net_debit from the F&O context, sl_premium = entry_premium * 0.78 (-22% SL), target_premium = entry_premium * 1.45 (+45% target).
+    2. For Book B (Index F&O): ALWAYS select 1 to 2 highest-probability NIFTY or BANKNIFTY setups (conviction >= 60) whenever an index has directional bias:
+       - Bullish bias (spot > ema20 OR RSI >= 52): select Bullish CE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bull_call_spread).
+       - Bearish bias (spot < ema20 OR RSI <= 48): select Bearish PE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bear_put_spread).
+       - Set entry_premium = exact ltp/net_debit from the F&O context, sl_premium = round(entry_premium * 0.80, 2) (-20% SL), target_premium = round(entry_premium * 1.40, 2) (+40% target).
     """
 
     models_to_try = list(CANDIDATE_MODELS)
@@ -668,14 +665,14 @@ async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_of
             log_agent_msg(msg_ws, cycle_id, "AG5_EQUITY", "TERMINAL", "BUY_EXECUTED",
                           f"[EQUITY] BUY {qty} x {t.symbol} @ ₹{t.entry_price} | SL: ₹{t.stop_loss} | Target: ₹{t.target_price}", t.model_dump())
 
-    # 6B. Execute Book B (Index F&O) Orders — calibrated for 1-lot NIFTY/BANKNIFTY execution
+    # 6B. Execute Book B (Index F&O) Orders — guaranteed 1-lot execution within ₹50k allocation
     fno_exec_count = 0
     fno_risk_budget = 2200.0 if locked_floor < COMBINED_PROFIT_FLOOR else max(0.0, (combined_today_pnl - locked_floor) * 0.40)
     fno_max_capital_per_trade = fno_cash / MAX_FNO_POSITIONS
 
     if allow_fno and fno_risk_budget >= 400.0:
         for f in decision_out.fno_trades:
-            if f.action != "BUY" or f.conviction < 65 or f.contract_symbol in open_fno_symbols or len(open_fno_symbols) >= MAX_FNO_POSITIONS:
+            if f.action != "BUY" or f.conviction < 60 or f.contract_symbol in open_fno_symbols or len(open_fno_symbols) >= MAX_FNO_POSITIONS:
                 continue
             if f.strategy_type == "SINGLE_LEG_BUY" and not naked_fno_allowed:
                 continue
@@ -689,7 +686,7 @@ async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_of
             lots_by_capital = int(fno_max_capital_per_trade / max(cost_per_lot, 1.0))
             lots = min(lots_by_risk, lots_by_capital)
 
-            if lots <= 0 and cost_per_lot <= 45000.0 and risk_per_lot <= 2600.0:
+            if lots <= 0 and cost_per_lot <= 50000.0:
                 lots = 1
             if lots <= 0:
                 continue
