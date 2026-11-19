@@ -59,8 +59,9 @@ open_trades = pd.DataFrame()
 if not trades_df.empty:
     if "date" not in trades_df.columns:
         trades_df["date"] = trades_df["timestamp"].astype(str).str[:10]
+    trades_df["pnl"] = pd.to_numeric(trades_df["pnl"], errors="coerce").fillna(0.0)
     closed_today = trades_df[(trades_df["date"] == today_str) & (trades_df["status"] != "OPEN")]
-    today_realized = float(closed_today["pnl"].astype(float).sum()) if not closed_today.empty else 0.0
+    today_realized = float(closed_today["pnl"].sum()) if not closed_today.empty else 0.0
     open_trades = trades_df[trades_df["status"] == "OPEN"]
 
 m1, m2, m3, m4 = st.columns(4)
