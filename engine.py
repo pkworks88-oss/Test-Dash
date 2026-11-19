@@ -223,7 +223,6 @@ async def run_gemini_committee(api_key: str, candidates: dict, current_pnl: floa
 
     models_to_try = list(CANDIDATE_MODELS)
 
-    # Auto-discover active models on this API key in case hardcoded aliases change
     try:
         async for m in await client.aio.models.list():
             m_name = m.name.replace("models/", "")
@@ -266,8 +265,9 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
     if not trades_df.empty:
         if "date" not in trades_df.columns:
             trades_df["date"] = trades_df["timestamp"].astype(str).str[:10]
+        trades_df["pnl"] = pd.to_numeric(trades_df["pnl"], errors="coerce").fillna(0.0)
         today_closed = trades_df[(trades_df["date"] == today_str) & (trades_df["status"] != "OPEN")]
-        today_realized_pnl = float(today_closed["pnl"].astype(float).sum()) if not today_closed.empty else 0.0
+        today_realized_pnl = float(today_closed["pnl"].sum()) if not today_closed.empty else 0.0
 
     all_records = trades_ws.get_all_records()
     open_rows = []
@@ -276,7 +276,7 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
     for idx, row in enumerate(all_records, start=2):
         if row["status"] == "OPEN":
             sym = row["symbol"]
-            qty = int(row["qty"])
+            qty = int(float(row["qty"]))
             entry = float(row["entry"])
             sl = float(row["sl"])
             target = float(row["target"])
@@ -303,7 +303,7 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
     open_symbols = set()
     for idx, row, cur_ltp, net_mtm in open_rows:
         sym = row["symbol"]
-        qty = int(row["qty"])
+        qty = int(float(row["qty"]))
         entry = float(row["entry"])
         sl = float(row["sl"])
         target = float(row["target"])
