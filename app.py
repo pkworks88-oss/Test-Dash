@@ -10,7 +10,9 @@ from engine import (
     get_gsheet_client,
     now_ist,
     INITIAL_CAPITAL,
+    INTRADAY_LEVERAGE,
     MIN_DAILY_PROFIT_FLOOR,
+    ESTIMATED_BROKERAGE_PCT,
     SHEET_NAME,
 )
 
@@ -60,23 +62,60 @@ trades_df = pd.DataFrame(sh.worksheet("trades").get_all_records())
 msgs_df = pd.DataFrame(sh.worksheet("agent_messages").get_all_records())
 
 today_realized = 0.0
+live_unrealized = 0.0
+margin_used = 0.0
 open_trades = pd.DataFrame()
+
 if not trades_df.empty:
     if "date" not in trades_df.columns:
         trades_df["date"] = trades_df["timestamp"].astype(str).str[:10]
     trades_df["pnl"] = pd.to_numeric(trades_df["pnl"], errors="coerce").fillna(0.0)
     trades_df["status_clean"] = trades_df["status"].astype(str).str.strip().str.upper()
+
     closed_today = trades_df[(trades_df["date"] == today_str) & (trades_df["status_clean"] != "OPEN")]
     today_realized = float(closed_today["pnl"].sum()) if not closed_today.empty else 0.0
-    open_trades = trades_df[trades_df["status_clean"] == "OPEN"].drop(columns=["status_clean"])
+    open_trades = trades_df[trades_df["status_clean"] == "OPEN"].drop(columns=["status_clean"]).copy()
 
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Account Capital", f"₹{cash_balance:,.2f}", f"{cash_balance - INITIAL_CAPITAL:+,.2f}")
-m2.metric("Today's Realized P&L", f"₹{today_realized:,.2f}", f"Peak: ₹{peak_pnl:,.2f}")
-m3.metric("Active Profit Floor", f"₹{locked_floor:,.2f}", "LOCKED >= ₹2K" if locked_floor >= MIN_DAILY_PROFIT_FLOOR else "Building Base")
-m4.metric("Open Positions", f"{len(open_trades)} / 3")
+    # Fetch live LTPs for open positions to calculate real-time MTM & Margin Used
+    if not open_trades.empty:
+        live_ltps = []
+        live_mtms = []
+        for _, r in open_trades.iterrows():
+            sym = str(r["symbol"]).strip()
+            qty = int(float(r["qty"]))
+            entry = float(r["entry"])
+            margin_used += (entry * qty) / INTRADAY_LEVERAGE
+            try:
+                q = yf.download(sym, period="1d", interval="1m", progress=False)
+                if not q.empty:
+                    if isinstance(q.columns, pd.MultiIndex):
+                        q.columns = q.columns.get_level_values(0)
+                    cur_ltp = float(q["Close"].iloc[-1])
+                else:
+                    cur_ltp = entry
+            except Exception:
+                cur_ltp = entry
 
-st.progress(min(1.0, max(0.0, today_realized / MIN_DAILY_PROFIT_FLOOR)))
+            net_mtm = round(((cur_ltp - entry) * qty) - ((entry + cur_ltp) * qty * ESTIMATED_BROKERAGE_PCT), 2)
+            live_ltps.append(round(cur_ltp, 2))
+            live_mtms.append(net_mtm)
+            live_unrealized += net_mtm
+
+        open_trades["live_ltp"] = live_ltps
+        open_trades["live_mtm_pnl"] = live_mtms
+
+net_live_equity = round(cash_balance + live_unrealized, 2)
+total_today_pnl = round(today_realized + live_unrealized, 2)
+free_margin = max(0.0, round(cash_balance - margin_used, 2))
+
+m1, m2, m3, m4, m5 = st.columns(5)
+m1.metric("Net Live Equity", f"₹{net_live_equity:,.2f}", f"{net_live_equity - INITIAL_CAPITAL:+,.2f}")
+m2.metric("Free MIS Margin", f"₹{free_margin:,.2f}", f"Used: ₹{margin_used:,.0f} (5x)")
+m3.metric("Today's Total P&L", f"₹{total_today_pnl:,.2f}", f"Floating: ₹{live_unrealized:+,.2f}")
+m4.metric("Active Profit Floor", f"₹{locked_floor:,.2f}", "LOCKED >= ₹2K" if locked_floor >= MIN_DAILY_PROFIT_FLOOR else f"Peak: ₹{peak_pnl:,.2f}")
+m5.metric("Open Positions", f"{len(open_trades)} / 3")
+
+st.progress(min(1.0, max(0.0, total_today_pnl / MIN_DAILY_PROFIT_FLOOR)))
 
 tab1, tab2, tab3 = st.tabs(["📊 Open Positions & Intraday Chart", "📜 Trade Ledger", "🤖 5-Agent Comms"])
 
