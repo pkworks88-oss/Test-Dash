@@ -30,7 +30,7 @@ INIT_EQ_CAPITAL = 100000.0        # Book A: Intraday MIS Equities
 INIT_FNO_CAPITAL = 100000.0       # Book B: Intraday Index Options (NIFTY / BANKNIFTY)
 EQ_INTRADAY_LEVERAGE = 5.0        # 5x MIS margin = ₹5,00,000 Equity buying power
 
-COMBINED_PROFIT_FLOOR = 4000.0    # Combined ₹4,000 minimum profit floor (2.0% on ₹2L)
+COMBINED_PROFIT_FLOOR = 4000.0    # Full 75% ratchet threshold
 TRAIL_RETENTION_RATIO = 0.75      # Locks 75% of excess profits above ₹4,000
 EQ_DAILY_MAX_LOSS = -1500.0       # Book A daily circuit breaker
 FNO_DAILY_MAX_LOSS = -2000.0      # Book B daily circuit breaker
@@ -38,7 +38,7 @@ FNO_DAILY_MAX_LOSS = -2000.0      # Book B daily circuit breaker
 MAX_EQ_POSITIONS = 3
 MAX_FNO_POSITIONS = 2
 
-ENTRY_CUTOFF_TIME = time(14, 30)  # No new entries after 02:30 PM IST
+ENTRY_CUTOFF_TIME = time(14, 00)  # Tightened: No new entries after 02:00 PM IST
 EXPIRY_NAKED_CUTOFF = time(13, 30)# No naked option buying after 01:30 PM on Tuesday expiry
 EOD_SQUAREOFF_TIME = time(15, 15) # Mandatory square-off at 03:15 PM IST
 
@@ -84,6 +84,47 @@ def get_gsheet_client(gcp_json: dict):
     ]
     creds = Credentials.from_service_account_info(gcp_json, scopes=scopes)
     return gspread.authorize(creds)
+
+
+def compute_stepped_portfolio_floor(peak_pnl: float, current_floor: float) -> float:
+    """
+    Two-tier portfolio profit protection:
+    - Peak >= ₹2,000 -> locks at least ₹1,000
+    - Peak >= ₹3,000 -> locks at least ₹2,000
+    - Peak >= ₹4,000 -> locks 75% of peak P&L (starts at ₹3,000 and ratchets up)
+    """
+    computed = 0.0
+    if peak_pnl >= COMBINED_PROFIT_FLOOR:
+        computed = round(peak_pnl * TRAIL_RETENTION_RATIO, 2)
+    elif peak_pnl >= 3000.0:
+        computed = 2000.0
+    elif peak_pnl >= 2000.0:
+        computed = 1000.0
+    return max(current_floor, computed)
+
+
+def compute_per_trade_trailing_sl(entry: float, sl: float, target: float, high_px: float, book: str) -> float:
+    """
+    Ratchets individual trade stop-loss upward as price progresses toward target:
+    - At >= 50% of target distance: moves SL to breakeven + charges buffer
+    - At >= 75% of target distance: locks in 50% of peak unrealized price gain
+    """
+    target_dist = target - entry
+    if target_dist <= 0:
+        return sl
+
+    gain_achieved = high_px - entry
+    progress = gain_achieved / target_dist
+    new_sl = sl
+
+    if progress >= 0.75:
+        lock_px = round(entry + (0.50 * gain_achieved), 2)
+        new_sl = max(new_sl, lock_px)
+    elif progress >= 0.50:
+        be_px = round(entry * 1.002, 2) if book == "EQUITY" else round(entry + 3.0, 2)
+        new_sl = max(new_sl, be_px)
+
+    return new_sl
 
 
 def init_or_load_ledger(client, today_str: str):
@@ -153,7 +194,6 @@ def bs_option_metrics(spot: float, strike: float, dte_days: float, iv: float, op
 
 
 def fetch_nse_option_chain_live(session, symbol: str) -> dict:
-    """Attempts direct NSE Option Chain fetch via curl_cffi; returns empty dict if NSE blocks cloud IP."""
     try:
         session.get("https://www.nseindia.com/option-chain", timeout=6)
         url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
@@ -171,8 +211,132 @@ def fetch_nse_option_chain_live(session, symbol: str) -> dict:
     return {}
 
 
+def parse_contract_and_price(contract_symbol: str, idx_spot_high_low: dict, vix_val: float, dte_days: float, live_ltps: dict) -> tuple[float, float, float]:
+    """
+    Computes (close_premium, high_premium, low_premium) for any F&O symbol
+    using live NSE LTP if available or Black-Scholes mapped across 1-min spot High/Low wicks.
+    """
+    parts = contract_symbol.split()
+    underlying = parts[0] if parts else "NIFTY"
+    spot_data = idx_spot_high_low.get(underlying)
+    if not spot_data:
+        base = live_ltps.get(contract_symbol, 0.0)
+        return base, base, base
+
+    s_close, s_high, s_low = spot_data["close"], spot_data["high"], spot_data["low"]
+    iv_dec = max(vix_val / 100.0, 0.11)
+
+    try:
+        if "BULL_CALL_SPREAD" in contract_symbol:
+            k_long, k_short = map(int, parts[1].split("/"))
+            c_l, _, _, _ = bs_option_metrics(s_close, k_long, dte_days, iv_dec, "CE")
+            c_s, _, _, _ = bs_option_metrics(s_close, k_short, dte_days, iv_dec, "CE")
+            h_l, _, _, _ = bs_option_metrics(s_high, k_long, dte_days, iv_dec, "CE")
+            h_s, _, _, _ = bs_option_metrics(s_high, k_short, dte_days, iv_dec, "CE")
+            l_l, _, _, _ = bs_option_metrics(s_low, k_long, dte_days, iv_dec, "CE")
+            l_s, _, _, _ = bs_option_metrics(s_low, k_short, dte_days, iv_dec, "CE")
+            return round(max(c_l - c_s, 3.0), 2), round(max(h_l - h_s, 3.0), 2), round(max(l_l - l_s, 3.0), 2)
+
+        if "BEAR_PUT_SPREAD" in contract_symbol:
+            k_long, k_short = map(int, parts[1].split("/"))
+            p_l, _, _, _ = bs_option_metrics(s_close, k_long, dte_days, iv_dec, "PE")
+            p_s, _, _, _ = bs_option_metrics(s_close, k_short, dte_days, iv_dec, "PE")
+            h_l, _, _, _ = bs_option_metrics(s_low, k_long, dte_days, iv_dec, "PE")
+            h_s, _, _, _ = bs_option_metrics(s_low, k_short, dte_days, iv_dec, "PE")
+            l_l, _, _, _ = bs_option_metrics(s_high, k_long, dte_days, iv_dec, "PE")
+            l_s, _, _, _ = bs_option_metrics(s_high, k_short, dte_days, iv_dec, "PE")
+            return round(max(p_l - p_s, 3.0), 2), round(max(h_l - h_s, 3.0), 2), round(max(l_l - l_s, 3.0), 2)
+
+        strike = int(parts[1])
+        opt_type = parts[2]
+        c_px, _, _, _ = bs_option_metrics(s_close, strike, dte_days, iv_dec, opt_type)
+        if opt_type == "CE":
+            h_px, _, _, _ = bs_option_metrics(s_high, strike, dte_days, iv_dec, "CE")
+            l_px, _, _, _ = bs_option_metrics(s_low, strike, dte_days, iv_dec, "CE")
+        else:
+            h_px, _, _, _ = bs_option_metrics(s_low, strike, dte_days, iv_dec, "PE")
+            l_px, _, _, _ = bs_option_metrics(s_high, strike, dte_days, iv_dec, "PE")
+
+        if contract_symbol in live_ltps:
+            c_px = live_ltps[contract_symbol]
+        return c_px, max(c_px, h_px), min(c_px, l_px)
+    except Exception:
+        base = live_ltps.get(contract_symbol, 0.0)
+        return base, base, base
+
+
+def fetch_fast_watchdog_quotes(session, open_records: list[dict], current_ist: datetime) -> tuple[dict, dict]:
+    """
+    Ultra-lightweight 1-minute ticker fetch ONLY for currently OPEN Equity & F&O symbols.
+    Returns (eq_ohlc_map, fno_ohlc_map) where each value is {'close': float, 'high': float, 'low': float}.
+    """
+    eq_syms = set()
+    need_nifty = False
+    need_banknifty = False
+    fno_contracts = set()
+
+    for r in open_records:
+        book = str(r.get("book", "EQUITY")).strip().upper()
+        sym = str(r["symbol"]).strip()
+        if book == "EQUITY":
+            eq_syms.add(sym)
+        else:
+            fno_contracts.add(sym)
+            if sym.startswith("BANKNIFTY"):
+                need_banknifty = True
+            else:
+                need_nifty = True
+
+    tickers_to_fetch = list(eq_syms)
+    if need_nifty:
+        tickers_to_fetch.append("^NSEI")
+    if need_banknifty:
+        tickers_to_fetch.append("^NSEBANK")
+    if fno_contracts:
+        tickers_to_fetch.append("^INDIAVIX")
+
+    if not tickers_to_fetch:
+        return {}, {}
+
+    raw = yf.download(tickers_to_fetch, period="1d", interval="1m", group_by="ticker", progress=False, threads=False, session=session)
+    eq_ohlc = {}
+    idx_ohlc = {}
+    vix_val = 14.5
+
+    for t in tickers_to_fetch:
+        try:
+            df = raw[t].dropna() if len(tickers_to_fetch) > 1 else raw.dropna()
+            if df.empty:
+                continue
+            recent = df.tail(2)
+            c_val = round(float(recent["Close"].iloc[-1]), 2)
+            h_val = round(float(recent["High"].max()), 2)
+            l_val = round(float(recent["Low"].min()), 2)
+
+            if t == "^INDIAVIX":
+                vix_val = c_val
+            elif t == "^NSEI":
+                idx_ohlc["NIFTY"] = {"close": c_val, "high": h_val, "low": l_val}
+            elif t == "^NSEBANK":
+                idx_ohlc["BANKNIFTY"] = {"close": c_val, "high": h_val, "low": l_val}
+            else:
+                eq_ohlc[t] = {"close": c_val, "high": h_val, "low": l_val}
+        except Exception:
+            continue
+
+    fno_ohlc = {}
+    if fno_contracts:
+        days_ahead = (1 - current_ist.weekday()) % 7
+        dte_days = max(0.25, float(days_ahead) if days_ahead > 0 else 0.35)
+        for c_sym in fno_contracts:
+            c_px, h_px, l_px = parse_contract_and_price(c_sym, idx_ohlc, vix_val, dte_days, {})
+            if c_px > 0:
+                fno_ohlc[c_sym] = {"close": c_px, "high": h_px, "low": l_px}
+
+    return eq_ohlc, fno_ohlc
+
+
 def fetch_index_fno_context(session=None, current_ist: datetime = None) -> dict:
-    """Fetches NIFTY, BANKNIFTY, and INDIA VIX intraday metrics + 11-strike live/BS-calibrated option chain."""
     if session is None:
         session = curl_requests.Session(impersonate="chrome")
     if current_ist is None:
@@ -423,7 +587,7 @@ async def run_unified_gemini_committee(
     - Book A (₹1,00,000 Equity MIS): Allowed = {allow_eq}
     - Book B (₹1,00,000 Index Options NIFTY/BANKNIFTY): Allowed = {allow_fno} | Naked Option Buying Allowed = {naked_fno_allowed}
 
-    Current Combined Today P&L: ₹{combined_pnl:.2f} | Combined Minimum Profit Floor Target: ₹{COMBINED_PROFIT_FLOOR:.2f} | Active Locked Floor: ₹{locked_floor:.2f}.
+    Current Combined Today P&L: ₹{combined_pnl:.2f} | Active Locked Floor: ₹{locked_floor:.2f}.
     All positions MUST close before 03:15 PM IST today.
 
     EQUITY CANDIDATES (Book A):
@@ -434,7 +598,7 @@ async def run_unified_gemini_committee(
 
     Rules:
     1. For Book A (Equity): Approve up to 2 highest-conviction BUY setups (R:R >= 1:1.6, conviction >= 60). Veto NEGATIVE_RISK news or RSI > 78.
-    2. For Book B (Index F&O): ALWAYS select 1 to 2 highest-probability NIFTY or BANKNIFTY setups (conviction >= 60) whenever an index has directional bias:
+    2. For Book B (Index F&O): Select 1 to 2 highest-probability NIFTY or BANKNIFTY setups (conviction >= 60) whenever an index has directional bias:
        - Bullish bias (spot > ema20 OR RSI >= 52): select Bullish CE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bull_call_spread).
        - Bearish bias (spot < ema20 OR RSI <= 48): select Bearish PE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bear_put_spread).
        - Set entry_premium = exact ltp/net_debit from the F&O context, sl_premium = round(entry_premium * 0.80, 2) (-20% SL), target_premium = round(entry_premium * 1.40, 2) (+40% target).
@@ -475,80 +639,74 @@ async def run_unified_gemini_committee(
     return fallback, f"GEMINI_ERROR: {last_err}"
 
 
-async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: bool = False):
-    current_ist = now_ist()
-    today_str = current_ist.strftime("%Y-%m-%d")
-    cycle_id = current_ist.strftime("%Y%m%d_%H%M%S")
+def evaluate_exits_and_trailing_sl(
+    acc_ws, trades_ws, msg_ws,
+    today_str: str, cycle_id: str,
+    eq_cash: float, fno_cash: float,
+    combined_peak_pnl: float, locked_floor: float,
+    eq_ohlc_map: dict, fno_ohlc_map: dict,
+    is_eod: bool
+) -> dict:
+    """
+    Core Fast-Watchdog evaluator: checks 1-minute High/Low wicks, ratchets per-trade
+    trailing stop-losses (50%->BE, 75%->50% gain lock), updates stepped portfolio floor
+    (₹2k->₹1k, ₹3k->₹2k, ₹4k+->75%), and triggers immediate exits.
+    """
+    all_records = trades_ws.get_all_records()
 
-    gc = get_gsheet_client(gcp_json)
-    sh, acc_ws, trades_ws, msg_ws, eq_cash, fno_cash, combined_peak_pnl, locked_floor, trades_df = init_or_load_ledger(gc, today_str)
-
-    session = curl_requests.Session(impersonate="chrome")
-    eq_df = fetch_equity_metrics(session, LIQUID_INTRADAY_UNIVERSE, today_str)
-    fno_ctx = fetch_index_fno_context(session, current_ist)
-
-    eq_ltp_map = dict(zip(eq_df["symbol"], eq_df["ltp"])) if not eq_df.empty else {}
-    fno_ltp_map = fno_ctx.get("live_option_ltps", {})
-
-    # 1. Calculate Today's Realized P&L per Book
     eq_realized_pnl = 0.0
     fno_realized_pnl = 0.0
-    if not trades_df.empty:
-        trades_df["net_pnl"] = pd.to_numeric(trades_df["net_pnl"], errors="coerce").fillna(0.0)
-        trades_df["status_clean"] = trades_df["status"].astype(str).str.strip().str.upper()
-        trades_df["book_clean"] = trades_df["book"].astype(str).str.strip().str.upper()
-        closed_today = trades_df[(trades_df["date"].astype(str) == today_str) & (trades_df["status_clean"] != "OPEN")]
-        eq_realized_pnl = float(closed_today[closed_today["book_clean"] == "EQUITY"]["net_pnl"].sum())
-        fno_realized_pnl = float(closed_today[closed_today["book_clean"] == "FNO"]["net_pnl"].sum())
-
-    # 2. Evaluate Live Open Positions across Both Books
-    all_records = trades_ws.get_all_records()
     open_rows = []
     eq_unrealized = 0.0
     fno_unrealized = 0.0
 
     for idx, row in enumerate(all_records, start=2):
-        if str(row.get("status", "")).strip().upper() == "OPEN":
-            book = str(row.get("book", "EQUITY")).strip().upper()
+        status_clean = str(row.get("status", "")).strip().upper()
+        book = str(row.get("book", "EQUITY")).strip().upper()
+        r_date = str(row.get("date", "")).strip()
+
+        if status_clean != "OPEN":
+            if r_date == today_str:
+                pnl_val = float(row.get("net_pnl", 0.0) or 0.0)
+                if book == "EQUITY":
+                    eq_realized_pnl += pnl_val
+                else:
+                    fno_realized_pnl += pnl_val
+        else:
             sym = str(row["symbol"]).strip()
             qty_or_lots = int(float(row["qty_or_lots"]))
             lot_size = int(float(row.get("lot_size", 1) or 1))
             entry = float(row["entry"])
 
             if book == "EQUITY":
-                cur_ltp = eq_ltp_map.get(sym, entry)
-                net_mtm = round(((cur_ltp - entry) * qty_or_lots) - ((entry + cur_ltp) * qty_or_lots * EQ_BROKERAGE_PCT), 2)
+                q = eq_ohlc_map.get(sym, {"close": entry, "high": entry, "low": entry})
+                net_mtm = round(((q["close"] - entry) * qty_or_lots) - ((entry + q["close"]) * qty_or_lots * EQ_BROKERAGE_PCT), 2)
                 eq_unrealized += net_mtm
             else:
-                cur_ltp = fno_ltp_map.get(sym, entry)
-                total_units = qty_or_lots * lot_size
-                net_mtm = round(((cur_ltp - entry) * total_units) - FNO_FLAT_ORDER_COST, 2)
+                q = fno_ohlc_map.get(sym, {"close": entry, "high": entry, "low": entry})
+                net_mtm = round(((q["close"] - entry) * qty_or_lots * lot_size) - FNO_FLAT_ORDER_COST, 2)
                 fno_unrealized += net_mtm
 
-            open_rows.append((idx, row, book, cur_ltp, net_mtm))
+            open_rows.append((idx, row, book, q, net_mtm))
 
     eq_total_pnl = round(eq_realized_pnl + eq_unrealized, 2)
     fno_total_pnl = round(fno_realized_pnl + fno_unrealized, 2)
     combined_today_pnl = round(eq_total_pnl + fno_total_pnl, 2)
 
-    # 3. Update Combined Peak & ₹4,000 Trailing Profit Floor
     if combined_today_pnl > combined_peak_pnl:
         combined_peak_pnl = combined_today_pnl
 
-    if combined_peak_pnl >= COMBINED_PROFIT_FLOOR:
-        excess = combined_peak_pnl - COMBINED_PROFIT_FLOOR
-        computed_floor = round(COMBINED_PROFIT_FLOOR + (excess * TRAIL_RETENTION_RATIO), 2)
-        locked_floor = max(locked_floor, computed_floor)
+    locked_floor = compute_stepped_portfolio_floor(combined_peak_pnl, locked_floor)
 
-    is_eod = current_ist.time() >= EOD_SQUAREOFF_TIME or force_square_off
-    floor_breached = (locked_floor >= COMBINED_PROFIT_FLOOR) and (combined_today_pnl <= locked_floor)
+    floor_breached = (locked_floor > 0.0) and (combined_today_pnl <= locked_floor)
     eq_loss_halted = eq_total_pnl <= EQ_DAILY_MAX_LOSS
     fno_loss_halted = fno_total_pnl <= FNO_DAILY_MAX_LOSS
 
     open_eq_symbols = set()
     open_fno_symbols = set()
+    closed_count = 0
 
-    for idx, row, book, cur_ltp, net_mtm in open_rows:
+    for idx, row, book, q, net_mtm in open_rows:
         sym = str(row["symbol"]).strip()
         qty_or_lots = int(float(row["qty_or_lots"]))
         lot_size = int(float(row.get("lot_size", 1) or 1))
@@ -556,25 +714,33 @@ async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_of
         sl = float(row["sl"])
         target = float(row["target"])
 
-        effective_sl = max(sl, round(entry * 1.002, 2)) if (locked_floor >= COMBINED_PROFIT_FLOOR and cur_ltp > entry * 1.005) else sl
+        cur_close = q["close"]
+        cur_high = q["high"]
+        cur_low = q["low"]
+
+        # 1. Ratchet Individual Trade SL using High wick progress toward target
+        new_sl = compute_per_trade_trailing_sl(entry, sl, target, cur_high, book)
+        if locked_floor > 0.0 and cur_close > entry * 1.004:
+            be_floor = round(entry * 1.002, 2) if book == "EQUITY" else round(entry + 3.0, 2)
+            new_sl = max(new_sl, be_floor)
 
         exit_reason = None
-        exit_px = cur_ltp
+        exit_px = cur_close
 
         if is_eod:
             exit_reason = "EOD_SQUAREOFF"
         elif floor_breached:
-            exit_reason = f"COMBINED_FLOOR_LOCK_{int(locked_floor)}"
+            exit_reason = f"PORTFOLIO_FLOOR_LOCK_{int(locked_floor)}"
         elif book == "EQUITY" and eq_loss_halted:
             exit_reason = "EQ_DAILY_MAX_LOSS"
         elif book == "FNO" and fno_loss_halted:
             exit_reason = "FNO_DAILY_MAX_LOSS"
-        elif cur_ltp <= effective_sl:
-            exit_reason = "TRAILING_SL_HIT" if effective_sl > sl else "SL_HIT"
-            exit_px = effective_sl
-        elif cur_ltp >= target:
+        elif cur_high >= target:
             exit_reason = "TARGET_HIT"
             exit_px = target
+        elif cur_low <= new_sl:
+            exit_reason = "TRAILING_SL_HIT" if new_sl > sl else "SL_HIT"
+            exit_px = new_sl
 
         if exit_reason:
             if book == "EQUITY":
@@ -587,34 +753,88 @@ async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_of
                 fno_realized_pnl += final_pnl
 
             trades_ws.update_cell(idx, 6, exit_reason)
+            trades_ws.update_cell(idx, 10, new_sl)
             trades_ws.update_cell(idx, 12, exit_px)
             trades_ws.update_cell(idx, 13, final_pnl)
-            log_agent_msg(msg_ws, cycle_id, f"AG5_{book}", "ALL", "EXIT",
-                          f"[{book}] Closed {sym} ({exit_reason}) @ ₹{exit_px} | Net P&L: ₹{final_pnl}", row)
+            closed_count += 1
+            log_agent_msg(msg_ws, cycle_id, f"WATCHDOG_{book}", "ALL", "EXIT",
+                          f"[{book}] Closed {sym} ({exit_reason}) @ ₹{exit_px} | Net P&L: ₹{final_pnl} | Floor: ₹{locked_floor}", row)
         else:
             if book == "EQUITY":
                 open_eq_symbols.add(sym)
             else:
                 open_fno_symbols.add(sym)
-            if effective_sl > sl:
-                trades_ws.update_cell(idx, 10, effective_sl)
+            if new_sl > sl:
+                trades_ws.update_cell(idx, 10, new_sl)
+                log_agent_msg(msg_ws, cycle_id, f"WATCHDOG_{book}", "TERMINAL", "SL_RATCHET",
+                              f"[{book}] Trailed SL for {sym}: ₹{sl} -> ₹{new_sl} (High: ₹{cur_high})", {"symbol": sym, "old_sl": sl, "new_sl": new_sl})
 
     sync_account_state(acc_ws, today_str, eq_cash, fno_cash, combined_peak_pnl, locked_floor)
 
-    if floor_breached:
-        return {"status": "COMBINED_FLOOR_LOCKED", "combined_pnl": round(eq_realized_pnl + fno_realized_pnl, 2), "locked_floor": locked_floor}
+    return {
+        "eq_cash": eq_cash,
+        "fno_cash": fno_cash,
+        "combined_peak_pnl": combined_peak_pnl,
+        "locked_floor": locked_floor,
+        "eq_total_pnl": eq_total_pnl,
+        "fno_total_pnl": fno_total_pnl,
+        "combined_today_pnl": combined_today_pnl,
+        "floor_breached": floor_breached,
+        "eq_loss_halted": eq_loss_halted,
+        "fno_loss_halted": fno_loss_halted,
+        "open_eq_symbols": open_eq_symbols,
+        "open_fno_symbols": open_fno_symbols,
+        "open_count": len(open_eq_symbols) + len(open_fno_symbols),
+        "closed_count": closed_count
+    }
+
+
+async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: bool = False):
+    """Full AI + Quantitative Scan Cycle (Runs once every 5 minutes or on manual button click)."""
+    current_ist = now_ist()
+    today_str = current_ist.strftime("%Y-%m-%d")
+    cycle_id = current_ist.strftime("%Y%m%d_%H%M%S")
+
+    gc = get_gsheet_client(gcp_json)
+    sh, acc_ws, trades_ws, msg_ws, eq_cash, fno_cash, combined_peak_pnl, locked_floor, trades_df = init_or_load_ledger(gc, today_str)
+
+    session = curl_requests.Session(impersonate="chrome")
+    eq_df = fetch_equity_metrics(session, LIQUID_INTRADAY_UNIVERSE, today_str)
+    fno_ctx = fetch_index_fno_context(session, current_ist)
+
+    eq_ohlc_map = {
+        r["symbol"]: {"close": r["ltp"], "high": r["ltp"], "low": r["ltp"]}
+        for _, r in eq_df.iterrows()
+    } if not eq_df.empty else {}
+
+    fno_ohlc_map = {
+        sym: {"close": px, "high": px, "low": px}
+        for sym, px in fno_ctx.get("live_option_ltps", {}).items()
+    }
+
+    is_eod = current_ist.time() >= EOD_SQUAREOFF_TIME or force_square_off
+    state = evaluate_exits_and_trailing_sl(
+        acc_ws, trades_ws, msg_ws, today_str, cycle_id,
+        eq_cash, fno_cash, combined_peak_pnl, locked_floor,
+        eq_ohlc_map, fno_ohlc_map, is_eod
+    )
+
+    if state["floor_breached"]:
+        return {"status": "PORTFOLIO_FLOOR_LOCKED", "combined_pnl": state["combined_today_pnl"], "locked_floor": state["locked_floor"]}
 
     if current_ist.time() >= ENTRY_CUTOFF_TIME or is_eod:
-        return {"status": "EOD_CUTOFF_MONITORING", "eq_pnl": eq_total_pnl, "fno_pnl": fno_total_pnl}
+        return {"status": "ENTRY_CUTOFF_MONITORING", "eq_pnl": state["eq_total_pnl"], "fno_pnl": state["fno_total_pnl"], "open_count": state["open_count"]}
 
-    allow_eq = (not eq_loss_halted) and (len(open_eq_symbols) < MAX_EQ_POSITIONS) and (not eq_df.empty)
-    allow_fno = (not fno_loss_halted) and (len(open_fno_symbols) < MAX_FNO_POSITIONS) and bool(fno_ctx.get("indices"))
+    open_eq_symbols = state["open_eq_symbols"]
+    open_fno_symbols = state["open_fno_symbols"]
+    allow_eq = (not state["eq_loss_halted"]) and (len(open_eq_symbols) < MAX_EQ_POSITIONS) and (not eq_df.empty)
+    allow_fno = (not state["fno_loss_halted"]) and (len(open_fno_symbols) < MAX_FNO_POSITIONS) and bool(fno_ctx.get("indices"))
     naked_fno_allowed = not (fno_ctx.get("is_tuesday_expiry") and current_ist.time() >= EXPIRY_NAKED_CUTOFF)
 
     if not allow_eq and not allow_fno:
-        return {"status": "BOOKS_AT_CAPACITY_OR_HALTED", "eq_open": len(open_eq_symbols), "fno_open": len(open_fno_symbols), "combined_pnl": combined_today_pnl}
+        return {"status": "BOOKS_AT_CAPACITY_OR_HALTED", "eq_open": len(open_eq_symbols), "fno_open": len(open_fno_symbols), "combined_pnl": state["combined_today_pnl"]}
 
-    # 4. Build Equity Candidate Slate
+    # Build Equity Candidate Slate
     eq_candidates = {}
     if allow_eq:
         avail_df = eq_df[~eq_df["symbol"].isin(open_eq_symbols)].copy()
@@ -633,9 +853,8 @@ async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_of
                     "headlines": fetch_stock_news(r["symbol"])
                 }
 
-    # 5. Unified Gemini Chief Analyst Review
     decision_out, model_status = await run_unified_gemini_committee(
-        gemini_api_key, eq_candidates, fno_ctx, combined_today_pnl, locked_floor, allow_eq, allow_fno, naked_fno_allowed
+        gemini_api_key, eq_candidates, fno_ctx, state["combined_today_pnl"], state["locked_floor"], allow_eq, allow_fno, naked_fno_allowed
     )
     log_agent_msg(
         msg_ws, cycle_id, "AG4_UNIFIED", "AG5_BROKER", "UNIFIED_REVIEW",
@@ -643,7 +862,12 @@ async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_of
         decision_out.model_dump()
     )
 
-    # 6A. Execute Book A (Equity MIS) Orders
+    eq_cash = state["eq_cash"]
+    fno_cash = state["fno_cash"]
+    locked_floor = state["locked_floor"]
+    combined_today_pnl = state["combined_today_pnl"]
+
+    # Execute Book A (Equity MIS) Orders
     eq_exec_count = 0
     eq_risk_budget = 550.0 if locked_floor < COMBINED_PROFIT_FLOOR else max(0.0, (combined_today_pnl - locked_floor) * 0.25)
     eq_max_exposure = (eq_cash * EQ_INTRADAY_LEVERAGE) / MAX_EQ_POSITIONS
@@ -665,7 +889,7 @@ async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_of
             log_agent_msg(msg_ws, cycle_id, "AG5_EQUITY", "TERMINAL", "BUY_EXECUTED",
                           f"[EQUITY] BUY {qty} x {t.symbol} @ ₹{t.entry_price} | SL: ₹{t.stop_loss} | Target: ₹{t.target_price}", t.model_dump())
 
-    # 6B. Execute Book B (Index F&O) Orders — guaranteed 1-lot execution within ₹50k allocation
+    # Execute Book B (Index F&O) Orders
     fno_exec_count = 0
     fno_risk_budget = 2200.0 if locked_floor < COMBINED_PROFIT_FLOOR else max(0.0, (combined_today_pnl - locked_floor) * 0.40)
     fno_max_capital_per_trade = fno_cash / MAX_FNO_POSITIONS
@@ -705,8 +929,59 @@ async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_of
         "regime": decision_out.market_regime,
         "eq_executed": eq_exec_count,
         "fno_executed": fno_exec_count,
-        "eq_pnl": eq_total_pnl,
-        "fno_pnl": fno_total_pnl,
-        "combined_pnl": combined_today_pnl,
-        "locked_floor": locked_floor
+        "eq_pnl": state["eq_total_pnl"],
+        "fno_pnl": state["fno_total_pnl"],
+        "combined_pnl": state["combined_today_pnl"],
+        "locked_floor": state["locked_floor"],
+        "open_count": len(open_eq_symbols) + len(open_fno_symbols)
     }
+
+
+async def run_fast_watchdog_loop(gemini_api_key: str, gcp_json: dict, duration_sec: int = 260, poll_interval_sec: int = 20):
+    """
+    High-Frequency 20-Second Price Watchdog:
+    1. Runs 1 full AI scan cycle at t=0.
+    2. For the next ~4.5 minutes, polls 1-minute High/Low/Close quotes ONLY for open positions
+       every 20 seconds (zero Gemini calls) to ratchet trailing SLs & trigger immediate exits.
+    """
+    first_res = await run_unified_cycle(gemini_api_key, gcp_json, force_square_off=False)
+    print(f"[{now_ist().strftime('%H:%M:%S')}] Initial AI Cycle -> {first_res}")
+
+    start_mono = pytime.monotonic()
+    gc = get_gsheet_client(gcp_json)
+    session = curl_requests.Session(impersonate="chrome")
+
+    while (pytime.monotonic() - start_mono) < duration_sec:
+        await asyncio.sleep(poll_interval_sec)
+        current_ist = now_ist()
+        if current_ist.time() > time(15, 22):
+            break
+
+        today_str = current_ist.strftime("%Y-%m-%d")
+        cycle_id = current_ist.strftime("%Y%m%d_%H%M%S")
+        sh, acc_ws, trades_ws, msg_ws, eq_cash, fno_cash, combined_peak_pnl, locked_floor, trades_df = init_or_load_ledger(gc, today_str)
+
+        open_records = [
+            r for r in trades_ws.get_all_records()
+            if str(r.get("status", "")).strip().upper() == "OPEN"
+        ]
+        if not open_records:
+            print(f"[{current_ist.strftime('%H:%M:%S')}] Watchdog idle (0 open positions).")
+            continue
+
+        eq_ohlc_map, fno_ohlc_map = fetch_fast_watchdog_quotes(session, open_records, current_ist)
+        is_eod = current_ist.time() >= EOD_SQUAREOFF_TIME
+
+        w_state = evaluate_exits_and_trailing_sl(
+            acc_ws, trades_ws, msg_ws, today_str, cycle_id,
+            eq_cash, fno_cash, combined_peak_pnl, locked_floor,
+            eq_ohlc_map, fno_ohlc_map, is_eod
+        )
+        print(
+            f"[{current_ist.strftime('%H:%M:%S')}] Fast Tick | Open: {w_state['open_count']} | "
+            f"Closed: {w_state['closed_count']} | Combined P&L: ₹{w_state['combined_today_pnl']} | "
+            f"Floor: ₹{w_state['locked_floor']}"
+        )
+
+        if w_state["floor_breached"] or is_eod:
+            break
