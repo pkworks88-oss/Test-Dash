@@ -37,12 +37,17 @@ with col1:
     if st.button("▶ Run Intraday Cycle Now", use_container_width=True):
         with st.spinner("Scanning intraday VWAP/RVOL & running Gemini committee..."):
             res = asyncio.run(run_full_cycle(gemini_key, gcp_json, force_square_off=False))
-            st.success(f"Cycle Result: {res}")
+            st.session_state["last_cycle_res"] = res
+            st.rerun()
 with col2:
     if st.button("🛑 Force EOD Square-Off All", type="primary", use_container_width=True):
         with st.spinner("Closing all open intraday positions..."):
             res = asyncio.run(run_full_cycle(gemini_key, gcp_json, force_square_off=True))
-            st.warning(f"Square-Off Executed: {res}")
+            st.session_state["last_cycle_res"] = res
+            st.rerun()
+
+if "last_cycle_res" in st.session_state:
+    st.success(f"Last Cycle Result: {st.session_state['last_cycle_res']}")
 
 gc = get_gsheet_client(gcp_json)
 sh = gc.open(SHEET_NAME)
@@ -60,9 +65,10 @@ if not trades_df.empty:
     if "date" not in trades_df.columns:
         trades_df["date"] = trades_df["timestamp"].astype(str).str[:10]
     trades_df["pnl"] = pd.to_numeric(trades_df["pnl"], errors="coerce").fillna(0.0)
-    closed_today = trades_df[(trades_df["date"] == today_str) & (trades_df["status"] != "OPEN")]
+    trades_df["status_clean"] = trades_df["status"].astype(str).str.strip().str.upper()
+    closed_today = trades_df[(trades_df["date"] == today_str) & (trades_df["status_clean"] != "OPEN")]
     today_realized = float(closed_today["pnl"].sum()) if not closed_today.empty else 0.0
-    open_trades = trades_df[trades_df["status"] == "OPEN"]
+    open_trades = trades_df[trades_df["status_clean"] == "OPEN"].drop(columns=["status_clean"])
 
 m1, m2, m3, m4 = st.columns(4)
 m1.metric("Account Capital", f"₹{cash_balance:,.2f}", f"{cash_balance - INITIAL_CAPITAL:+,.2f}")
@@ -95,7 +101,8 @@ with tab1:
         st.info("No open intraday positions currently held.")
 
 with tab2:
-    st.dataframe(trades_df.iloc[::-1] if not trades_df.empty else trades_df, use_container_width=True)
+    display_trades = trades_df.drop(columns=["status_clean"], errors="ignore") if not trades_df.empty else trades_df
+    st.dataframe(display_trades.iloc[::-1] if not display_trades.empty else display_trades, use_container_width=True)
 
 with tab3:
     st.dataframe(msgs_df.tail(30).iloc[::-1] if not msgs_df.empty else msgs_df, use_container_width=True)
