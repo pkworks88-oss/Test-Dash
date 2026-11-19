@@ -66,12 +66,6 @@ st.markdown("""
     font-weight: 600;
     margin-right: 8px;
 }
-.info-card {
-    background: #0b1426;
-    border: 1px solid #1e293b;
-    border-radius: 10px;
-    padding: 14px;
-}
 </style>
 """, unsafe_allow_html=True)
 
@@ -88,7 +82,7 @@ st.markdown(f"""
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;">
         <div>
             <div class="hero-title">⚡ NSE ₹2,00,000 Unified Multi-Asset 5-Agent Terminal</div>
-            <div class="hero-sub">IST Clock: <b>{current_ist.strftime('%Y-%m-%d %H:%M:%S')}</b> &nbsp;|&nbsp; Book A: ₹1,00,000 Equity MIS (5x) &nbsp;|&nbsp; Book B: ₹1,00,000 Index F&O &nbsp;|&nbsp; EOD Square-Off: 03:15 PM IST</div>
+            <div class="hero-sub">IST Clock: <b>{current_ist.strftime('%Y-%m-%d %H:%M:%S')}</b>  |  Book A: ₹1,00,000 Equity MIS (5x)  |  Book B: ₹1,00,000 Index F&O  |  EOD Square-Off: 03:15 PM IST</div>
         </div>
         <div>
             <span class="badge-pill">{"🔥 NIFTY WEEKLY EXPIRY DAY" if is_tuesday else "🟢 STANDARD SESSION"}</span>
@@ -98,7 +92,6 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-# Action Controls
 b1, b2, b3 = st.columns([1.2, 1.2, 1])
 with b1:
     if st.button("▶ Run Unified Multi-Asset Cycle Now", use_container_width=True):
@@ -131,7 +124,6 @@ def get_cached_market_snapshot():
 with st.spinner("Loading live NSE Index, Option Chain & Equity telemetry..."):
     fno_ctx, eq_market_df = get_cached_market_snapshot()
 
-# Load Google Sheets Ledger
 gc = get_gsheet_client(gcp_json)
 sh = gc.open(SHEET_NAME)
 acc_vals = sh.worksheet("account").row_values(2)
@@ -203,7 +195,6 @@ combined_today_pnl = round(eq_total_today + fno_total_today, 2)
 eq_open_df = open_trades[open_trades["book"].astype(str).str.upper() == "EQUITY"] if not open_trades.empty else pd.DataFrame()
 fno_open_df = open_trades[open_trades["book"].astype(str).str.upper() == "FNO"] if not open_trades.empty else pd.DataFrame()
 
-# Top 6-Card Master Telemetry Strip
 k1, k2, k3, k4, k5, k6 = st.columns(6)
 k1.metric("Combined Net Equity", f"₹{total_equity:,.2f}", f"{total_equity - 200000:+,.2f}")
 k2.metric("Book A: Equity MIS", f"₹{eq_cash + eq_unrealized:,.2f}", f"P&L: ₹{eq_total_today:+,.2f} ({len(eq_open_df)}/3)")
@@ -214,7 +205,6 @@ k6.metric("India VIX", f"{fno_ctx.get('india_vix', 14.5):.2f}", f"DTE: {fno_ctx.
 
 st.progress(min(1.0, max(0.0, combined_today_pnl / COMBINED_PROFIT_FLOOR)))
 
-# --- 6 SPECIALIZED TABS ---
 tab_overview, tab_eq, tab_fno, tab_charts, tab_ledger, tab_comms = st.tabs([
     "🌐 Command Overview",
     "📈 Intraday Equity Desk (Book A)",
@@ -224,9 +214,6 @@ tab_overview, tab_eq, tab_fno, tab_charts, tab_ledger, tab_comms = st.tabs([
     "🤖 5-Agent Intelligence Log"
 ])
 
-# ==============================================================================
-# TAB 1: COMMAND OVERVIEW
-# ==============================================================================
 with tab_overview:
     c_left, c_right = st.columns([1.35, 1])
 
@@ -237,7 +224,6 @@ with tab_overview:
         else:
             st.info("No active positions open. Click 'Run Unified Multi-Asset Cycle Now' or wait for the 5-minute cloud scheduler.")
 
-        # Cumulative Equity Curve from Historical Trades
         st.subheader("Cumulative Net P&L Trajectory")
         if not trades_df.empty and (trades_df["status_clean"] != "OPEN").any():
             closed_all = trades_df[trades_df["status_clean"] != "OPEN"].copy()
@@ -279,9 +265,6 @@ with tab_overview:
         g1.metric("Book A Loss Buffer", f"₹{eq_total_today - EQ_DAILY_MAX_LOSS:,.0f}", f"Limit: ₹{EQ_DAILY_MAX_LOSS:,.0f}")
         g2.metric("Book B Loss Buffer", f"₹{fno_total_today - FNO_DAILY_MAX_LOSS:,.0f}", f"Limit: ₹{FNO_DAILY_MAX_LOSS:,.0f}")
 
-# ==============================================================================
-# TAB 2: INTRADAY EQUITY DESK (BOOK A)
-# ==============================================================================
 with tab_eq:
     st.subheader("Book A — Intraday Equity MIS Desk (₹1,00,000 Margin | 5x Leverage = ₹5,00,000 Power)")
     e1, e2, e3, e4 = st.columns(4)
@@ -296,7 +279,6 @@ with tab_eq:
 
     st.markdown("#### Live 61-Stock Intraday Momentum & VWAP Scanner")
     if not eq_market_df.empty:
-        # Filter controls
         f1, f2, f3 = st.columns(3)
         only_above_vwap = f1.checkbox("Only Stocks Above VWAP", value=True)
         min_rvol = f2.slider("Minimum Relative Volume (RVOL)", 0.5, 4.0, 1.0, 0.1)
@@ -311,7 +293,6 @@ with tab_eq:
         with col_tbl:
             st.dataframe(filt_df.sort_values("rvol", ascending=False), use_container_width=True, height=380)
         with col_sc:
-            # Momentum Scatter: RSI vs Day Change % sized by RVOL
             fig_sc = go.Figure(data=[go.Scatter(
                 x=eq_market_df["rsi14"],
                 y=eq_market_df["day_chg_pct"],
@@ -337,9 +318,6 @@ with tab_eq:
     else:
         st.warning("Equity scanner data is currently refreshing.")
 
-# ==============================================================================
-# TAB 3: INDEX F&O & OPTION CHAIN DESK (BOOK B)
-# ==============================================================================
 with tab_fno:
     st.subheader("Book B — Index Derivatives Desk (NIFTY Weekly & BANKNIFTY Monthly)")
     indices_data = fno_ctx.get("indices", {})
@@ -348,7 +326,6 @@ with tab_fno:
         sel_idx = st.radio("Select Index Underlying", list(indices_data.keys()), horizontal=True)
         idata = indices_data[sel_idx]
 
-        # Index & Greeks Strip
         i1, i2, i3, i4, i5, i6 = st.columns(6)
         i1.metric(f"{sel_idx} Spot", f"{idata['spot']:,.2f}", f"{idata['day_chg_pct']:+.2f}%")
         i2.metric("ATM Strike", f"{idata['atm_strike']}", f"Lot Size: {idata['lot_size']}")
@@ -357,34 +334,16 @@ with tab_fno:
         i5.metric("ATM PE LTP / Δ", f"₹{idata['atm_pe']['ltp']:.2f}", f"Δ {idata['atm_pe']['delta']} | Θ {idata['atm_pe']['theta']}")
         i6.metric("Chain Feed", idata.get("chain_source", "CALIBRATED"), f"RSI: {idata['rsi14']}")
 
-        # Strategy Cards (Single Leg vs Theta-Shielded Debit Spreads)
         s1, s2, s3, s4 = st.columns(4)
-        s1.info(f"**ATM Call Buy**
-
-`{idata['atm_ce']['symbol']}`
-
-LTP: **₹{idata['atm_ce']['ltp']}** (1 Lot = ₹{idata['atm_ce']['ltp']*idata['lot_size']:,.0f})")
-        s2.info(f"**ATM Put Buy**
-
-`{idata['atm_pe']['symbol']}`
-
-LTP: **₹{idata['atm_pe']['ltp']}** (1 Lot = ₹{idata['atm_pe']['ltp']*idata['lot_size']:,.0f})")
-        s3.success(f"**Bull Call Debit Spread**
-
-`{idata['bull_call_spread']['symbol']}`
-
-Net Debit: **₹{idata['bull_call_spread']['net_debit']}**")
-        s4.warning(f"**Bear Put Debit Spread**
-
-`{idata['bear_put_spread']['symbol']}`
-
-Net Debit: **₹{idata['bear_put_spread']['net_debit']}**")
+        s1.info(f"**ATM Call Buy**\n\n`{idata['atm_ce']['symbol']}`\n\nLTP: **₹{idata['atm_ce']['ltp']}** (1 Lot = ₹{idata['atm_ce']['ltp']*idata['lot_size']:,.0f})")
+        s2.info(f"**ATM Put Buy**\n\n`{idata['atm_pe']['symbol']}`\n\nLTP: **₹{idata['atm_pe']['ltp']}** (1 Lot = ₹{idata['atm_pe']['ltp']*idata['lot_size']:,.0f})")
+        s3.success(f"**Bull Call Debit Spread**\n\n`{idata['bull_call_spread']['symbol']}`\n\nNet Debit: **₹{idata['bull_call_spread']['net_debit']}**")
+        s4.warning(f"**Bear Put Debit Spread**\n\n`{idata['bear_put_spread']['symbol']}`\n\nNet Debit: **₹{idata['bear_put_spread']['net_debit']}**")
 
         if not fno_open_df.empty:
             st.markdown("#### Active Index Option Positions")
             st.dataframe(fno_open_df, use_container_width=True)
 
-        # Option Chain Table + Open Interest Bar Chart
         chain_df = pd.DataFrame(idata.get("chain_table", []))
         if not chain_df.empty:
             c_chain, c_oi = st.columns([1.3, 1])
@@ -401,9 +360,6 @@ Net Debit: **₹{idata['bear_put_spread']['net_debit']}**")
     else:
         st.warning("Index F&O telemetry unavailable right now.")
 
-# ==============================================================================
-# TAB 4: INTERACTIVE CANDLESTICK & F&O PAYOFF LAB
-# ==============================================================================
 with tab_charts:
     col_c1, col_c2 = st.columns([1.4, 1])
 
@@ -454,7 +410,6 @@ with tab_charts:
             pdata = indices_data[p_idx]
             spot_now = pdata["spot"]
             atm_k = pdata["atm_strike"]
-            step_k = pdata["strike_step"]
             lot_sz = pdata["lot_size"]
             spot_grid = np.linspace(spot_now * 0.985, spot_now * 1.015, 60)
 
@@ -484,9 +439,6 @@ with tab_charts:
             )
             st.plotly_chart(fig_pay, use_container_width=True)
 
-# ==============================================================================
-# TAB 5: UNIFIED TRADE LEDGER & ANALYTICS
-# ==============================================================================
 with tab_ledger:
     st.subheader("Unified Multi-Asset Trade History & Performance Attribution")
     if not trades_df.empty:
@@ -505,9 +457,6 @@ with tab_ledger:
     else:
         st.info("No trades recorded in the ledger yet.")
 
-# ==============================================================================
-# TAB 6: 5-AGENT INTELLIGENCE LOG
-# ==============================================================================
 with tab_comms:
     st.subheader("Real-Time Multi-Agent Committee Audit Trail")
     if not msgs_df.empty:
