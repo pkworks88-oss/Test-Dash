@@ -34,6 +34,11 @@ ENTRY_CUTOFF_TIME = time(14, 30)  # No new entries after 02:30 PM IST
 EOD_SQUAREOFF_TIME = time(15, 15) # Force close all positions at 03:15 PM IST
 ESTIMATED_BROKERAGE_PCT = 0.0006  # ~0.06% round-trip STT + brokerage + GST buffer
 
+EXPECTED_TRADE_HEADERS = [
+    "timestamp", "date", "symbol", "tier", "status", "qty",
+    "entry", "sl", "target", "exit_price", "pnl", "reasoning"
+]
+
 LIQUID_INTRADAY_UNIVERSE = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "BHARTIARTL.NS", "ICICIBANK.NS",
     "INFY.NS", "SBIN.NS", "HINDUNILVR.NS", "ITC.NS", "LT.NS", "HCLTECH.NS",
@@ -68,6 +73,10 @@ def init_or_load_ledger(client, today_str: str):
     trades_ws = sh.worksheet("trades")
     msg_ws = sh.worksheet("agent_messages")
 
+    # Enforce exact 12-column schema in trades worksheet so columns never shift
+    if trades_ws.row_values(1) != EXPECTED_TRADE_HEADERS:
+        trades_ws.update("A1:L1", [EXPECTED_TRADE_HEADERS])
+
     row_vals = acc_ws.row_values(2)
     cash_balance = float(row_vals[0]) if len(row_vals) >= 1 and row_vals[0] else INITIAL_CAPITAL
     stored_date = row_vals[1] if len(row_vals) >= 2 else ""
@@ -83,9 +92,7 @@ def init_or_load_ledger(client, today_str: str):
         ])
 
     trades_records = trades_ws.get_all_records()
-    trades_df = pd.DataFrame(trades_records) if trades_records else pd.DataFrame(
-        columns=["timestamp", "date", "symbol", "tier", "status", "qty", "entry", "sl", "target", "exit_price", "pnl", "reasoning"]
-    )
+    trades_df = pd.DataFrame(trades_records) if trades_records else pd.DataFrame(columns=EXPECTED_TRADE_HEADERS)
     return sh, acc_ws, trades_ws, msg_ws, cash_balance, peak_daily_pnl, locked_floor, trades_df
 
 
@@ -266,7 +273,8 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
         if "date" not in trades_df.columns:
             trades_df["date"] = trades_df["timestamp"].astype(str).str[:10]
         trades_df["pnl"] = pd.to_numeric(trades_df["pnl"], errors="coerce").fillna(0.0)
-        today_closed = trades_df[(trades_df["date"] == today_str) & (trades_df["status"] != "OPEN")]
+        trades_df["status_clean"] = trades_df["status"].astype(str).str.strip().str.upper()
+        today_closed = trades_df[(trades_df["date"] == today_str) & (trades_df["status_clean"] != "OPEN")]
         today_realized_pnl = float(today_closed["pnl"].sum()) if not today_closed.empty else 0.0
 
     all_records = trades_ws.get_all_records()
@@ -274,8 +282,9 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
     live_unrealized_pnl = 0.0
 
     for idx, row in enumerate(all_records, start=2):
-        if row["status"] == "OPEN":
-            sym = row["symbol"]
+        status_clean = str(row.get("status", "")).strip().upper()
+        if status_clean == "OPEN":
+            sym = str(row["symbol"]).strip()
             qty = int(float(row["qty"]))
             entry = float(row["entry"])
             sl = float(row["sl"])
@@ -302,7 +311,7 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
 
     open_symbols = set()
     for idx, row, cur_ltp, net_mtm in open_rows:
-        sym = row["symbol"]
+        sym = str(row["symbol"]).strip()
         qty = int(float(row["qty"]))
         entry = float(row["entry"])
         sl = float(row["sl"])
@@ -361,7 +370,7 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
         return {"status": "NO_MARKET_DATA", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
 
     if len(open_symbols) >= MAX_CONCURRENT_TRADES:
-        return {"status": "ACTIVE_POSITIONS_RUNNING", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
+        return {"status": "ACTIVE_POSITIONS_RUNNING", "open_count": len(open_symbols), "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
 
     # 5. Quantitative Momentum Funnel (AG1, AG2, AG3)
     avail_df = metrics_df[~metrics_df["symbol"].isin(open_symbols)].copy()
