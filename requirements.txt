@@ -4,7 +4,7 @@ curl_cffi
 pandas
 numpy
 pydantic
-google-genai
+google-genai>=1.0.0
 feedparser
 gspread
 google-auth
