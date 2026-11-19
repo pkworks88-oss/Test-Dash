@@ -1,10 +1,12 @@
 import os
 import json
 import asyncio
+import time as pytime
 from datetime import datetime, timezone, timedelta, time
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from curl_cffi import requests as curl_requests
 import feedparser
 import gspread
 from google.oauth2.service_account import Credentials
@@ -13,7 +15,7 @@ from google.genai import types
 from schemas import CommitteeOutput
 
 IST = timezone(timedelta(hours=5, minutes=30))
-CANDIDATE_MODELS = ["gemini-2.5-flash", "gemini-2.0-flash"]
+CANDIDATE_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
 SHEET_NAME = "NSE_Intraday_1L_Ledger"
 
 # --- INTRADAY ₹1,00,000 CONFIGURATION (₹2,000 MINIMUM FLOOR) ---
@@ -31,14 +33,14 @@ LIQUID_INTRADAY_UNIVERSE = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "BHARTIARTL.NS", "ICICIBANK.NS",
     "INFY.NS", "SBIN.NS", "HINDUNILVR.NS", "ITC.NS", "LT.NS", "HCLTECH.NS",
     "BAJFINANCE.NS", "SUNPHARMA.NS", "MARUTI.NS", "AXISBANK.NS", "KOTAKBANK.NS",
-    "TITAN.NS", "ONGC.NS", "TATAMOTORS.NS", "ADANIENT.NS", "NTPC.NS", "M&M.NS",
+    "TITAN.NS", "ONGC.NS", "ADANIENT.NS", "NTPC.NS", "M&M.NS",
     "POWERGRID.NS", "WIPRO.NS", "COALINDIA.NS", "JSWSTEEL.NS", "TATASTEEL.NS",
     "ADANIPORTS.NS", "HAL.NS", "BEL.NS", "TRENT.NS", "SIEMENS.NS", "VBL.NS",
     "INDIGO.NS", "DLF.NS", "HINDALCO.NS", "BPCL.NS", "BANKBARODA.NS", "PNB.NS",
     "CANBK.NS", "CHOLAFIN.NS", "SHRIRAMFIN.NS", "RECLTD.NS", "PFC.NS", "IRFC.NS",
     "RVNL.NS", "MAZDOCK.NS", "BHEL.NS", "SAIL.NS", "VEDL.NS", "POLYCAB.NS",
     "DIXON.NS", "ABB.NS", "CGPOWER.NS", "SUZLON.NS", "TATAPOWER.NS", "PERSISTENT.NS",
-    "COFORGE.NS", "KPITTECH.NS", "NAUKRI.NS", "IRCTC.NS", "ZOMATO.NS", "JIOFIN.NS"
+    "COFORGE.NS", "KPITTECH.NS", "NAUKRI.NS", "IRCTC.NS", "JIOFIN.NS"
 ]
 
 
@@ -87,80 +89,100 @@ def sync_account_state(acc_ws, cash_balance: float, today_str: str, peak_daily_p
 
 
 def log_agent_msg(msg_ws, cycle_id: str, sender: str, recipient: str, msg_type: str, summary: str, payload: dict):
-    msg_ws.append_row([
-        cycle_id,
-        now_ist().strftime("%Y-%m-%d %H:%M:%S"),
-        sender,
-        recipient,
-        msg_type,
-        summary,
-        json.dumps(payload, default=str)[:45000]
-    ])
+    try:
+        msg_ws.append_row([
+            cycle_id,
+            now_ist().strftime("%Y-%m-%d %H:%M:%S"),
+            sender,
+            recipient,
+            msg_type,
+            summary,
+            json.dumps(payload, default=str)[:45000]
+        ])
+    except Exception:
+        pass
 
 
 def fetch_intraday_metrics(tickers: list[str]) -> pd.DataFrame:
-    raw = yf.download(tickers, period="5d", interval="5m", group_by="ticker", progress=False, threads=True)
+    session = curl_requests.Session(impersonate="chrome")
     today_str = now_ist().strftime("%Y-%m-%d")
     rows = []
 
-    for sym in tickers:
+    chunk_size = 20
+    for i in range(0, len(tickers), chunk_size):
+        batch = tickers[i:i + chunk_size]
         try:
-            df = raw[sym].dropna() if len(tickers) > 1 else raw.dropna()
-            if df.empty or len(df) < 30:
-                continue
-
-            if df.index.tz is None:
-                df.index = df.index.tz_localize("UTC").tz_convert(IST)
-            else:
-                df.index = df.index.tz_convert(IST)
-
-            today_df = df[df.index.strftime("%Y-%m-%d") == today_str]
-            if today_df.empty:
-                today_df = df.tail(75)
-
-            ltp = float(today_df["Close"].iloc[-1])
-            day_open = float(today_df["Open"].iloc[0])
-            if ltp < 50 or ltp > 15000:
-                continue
-
-            tp = (today_df["High"] + today_df["Low"] + today_df["Close"]) / 3.0
-            vwap = float((tp * today_df["Volume"]).sum() / max(today_df["Volume"].sum(), 1))
-
-            close_s = df["Close"]
-            ema9 = float(close_s.ewm(span=9, adjust=False).mean().iloc[-1])
-            ema20 = float(close_s.ewm(span=20, adjust=False).mean().iloc[-1])
-
-            delta = close_s.diff()
-            gain = delta.clip(lower=0).rolling(14).mean()
-            loss = (-delta.clip(upper=0)).rolling(14).mean()
-            rs = gain / loss.replace(0, np.nan)
-            rsi14 = float((100 - (100 / (1 + rs))).iloc[-1])
-
-            tr = pd.concat([
-                df["High"] - df["Low"],
-                (df["High"] - df["Close"].shift()).abs(),
-                (df["Low"] - df["Close"].shift()).abs()
-            ], axis=1).max(axis=1)
-            atr5m = float(tr.rolling(14).mean().iloc[-1])
-
-            avg_vol = float(df["Volume"].tail(20).mean())
-            cur_vol = float(today_df["Volume"].iloc[-1])
-            rvol = round(cur_vol / max(avg_vol, 1), 2)
-            day_chg_pct = round(((ltp - day_open) / day_open) * 100, 2)
-
-            rows.append({
-                "symbol": sym,
-                "ltp": round(ltp, 2),
-                "vwap": round(vwap, 2),
-                "ema9": round(ema9, 2),
-                "ema20": round(ema20, 2),
-                "rsi14": round(rsi14, 2),
-                "atr5m": round(max(atr5m, ltp * 0.002), 2),
-                "rvol": rvol,
-                "day_chg_pct": day_chg_pct
-            })
+            raw = yf.download(
+                batch,
+                period="5d",
+                interval="5m",
+                group_by="ticker",
+                progress=False,
+                threads=False,
+                session=session
+            )
         except Exception:
             continue
+
+        for sym in batch:
+            try:
+                df = raw[sym].dropna() if len(batch) > 1 else raw.dropna()
+                if df.empty or len(df) < 20:
+                    continue
+
+                if df.index.tz is None:
+                    df.index = df.index.tz_localize("UTC").tz_convert(IST)
+                else:
+                    df.index = df.index.tz_convert(IST)
+
+                today_df = df[df.index.strftime("%Y-%m-%d") == today_str]
+                if today_df.empty:
+                    today_df = df.tail(75)
+
+                ltp = float(today_df["Close"].iloc[-1])
+                day_open = float(today_df["Open"].iloc[0])
+                if ltp < 50 or ltp > 15000:
+                    continue
+
+                tp = (today_df["High"] + today_df["Low"] + today_df["Close"]) / 3.0
+                vwap = float((tp * today_df["Volume"]).sum() / max(today_df["Volume"].sum(), 1))
+
+                close_s = df["Close"]
+                ema9 = float(close_s.ewm(span=9, adjust=False).mean().iloc[-1])
+                ema20 = float(close_s.ewm(span=20, adjust=False).mean().iloc[-1])
+
+                delta = close_s.diff()
+                gain = delta.clip(lower=0).rolling(14).mean()
+                loss = (-delta.clip(upper=0)).rolling(14).mean()
+                rs = gain / loss.replace(0, np.nan)
+                rsi14 = float((100 - (100 / (1 + rs))).iloc[-1])
+
+                tr = pd.concat([
+                    df["High"] - df["Low"],
+                    (df["High"] - df["Close"].shift()).abs(),
+                    (df["Low"] - df["Close"].shift()).abs()
+                ], axis=1).max(axis=1)
+                atr5m = float(tr.rolling(14).mean().iloc[-1])
+
+                avg_vol = float(df["Volume"].tail(20).mean())
+                cur_vol = float(today_df["Volume"].iloc[-1])
+                rvol = round(cur_vol / max(avg_vol, 1), 2)
+                day_chg_pct = round(((ltp - day_open) / day_open) * 100, 2)
+
+                rows.append({
+                    "symbol": sym,
+                    "ltp": round(ltp, 2),
+                    "vwap": round(vwap, 2),
+                    "ema9": round(ema9, 2),
+                    "ema20": round(ema20, 2),
+                    "rsi14": round(rsi14, 2),
+                    "atr5m": round(max(atr5m, ltp * 0.002), 2),
+                    "rvol": rvol,
+                    "day_chg_pct": day_chg_pct
+                })
+            except Exception:
+                continue
+        pytime.sleep(0.8)
 
     return pd.DataFrame(rows)
 
@@ -172,12 +194,12 @@ def fetch_stock_news(symbol: str) -> list[str]:
     return [entry.title for entry in feed.entries[:3]]
 
 
-async def run_gemini_committee(api_key: str, candidates: dict, current_pnl: float, locked_floor: float) -> CommitteeOutput:
+async def run_gemini_committee(api_key: str, candidates: dict, current_pnl: float, locked_floor: float) -> tuple[CommitteeOutput, str]:
     client = genai.Client(api_key=api_key)
     mode_note = (
-        f"HOUSE-MONEY EXPANSION MODE: We have already secured our ₹{locked_floor:.2f} minimum profit floor (Current P&L: ₹{current_pnl:.2f}). Only approve A+ momentum continuations with tight stop-losses."
+        f"HOUSE-MONEY EXPANSION MODE: We have already secured our ₹{locked_floor:.2f} minimum profit floor (Current P&L: ₹{current_pnl:.2f}). Approve strong momentum continuations with tight stop-losses."
         if locked_floor >= MIN_DAILY_PROFIT_FLOOR else
-        f"BASE TARGET MODE: Current P&L is ₹{current_pnl:.2f}. We need to cross our ₹2,000 minimum daily profit floor cleanly."
+        f"BASE TARGET MODE: Current P&L is ₹{current_pnl:.2f}. Select high-probability intraday momentum setups to cross our ₹2,000 minimum daily profit floor."
     )
 
     prompt = f"""
@@ -189,11 +211,12 @@ async def run_gemini_committee(api_key: str, candidates: dict, current_pnl: floa
     {json.dumps(candidates, indent=2)}
 
     Rules:
-    1. Approve 1 to 2 highest-probability BUY setups with Risk-to-Reward >= 1:1.8.
-    2. Veto (SKIP) any stock with NEGATIVE_RISK news or overbought RSI > 76.
-    3. Target should allow strong runners (1.0% to 2.5% intraday move) while keeping Stop-Loss tight below VWAP/ATR.
+    1. Approve 1 to 3 highest-probability BUY setups with Risk-to-Reward >= 1:1.6. Set entry_price = ltp, stop_loss = suggested_sl, target_price = suggested_target.
+    2. Veto (SKIP) any stock ONLY if it has NEGATIVE_RISK news or extreme overbought RSI > 78.
+    3. Provide clear conviction (0-100) and concise reasoning for every candidate.
     """
 
+    last_err = ""
     for model_name in CANDIDATE_MODELS:
         try:
             response = await client.aio.models.generate_content(
@@ -205,10 +228,11 @@ async def run_gemini_committee(api_key: str, candidates: dict, current_pnl: floa
                     temperature=0.2,
                 ),
             )
-            return CommitteeOutput.model_validate_json(response.text)
-        except Exception:
+            return CommitteeOutput.model_validate_json(response.text), f"OK ({model_name})"
+        except Exception as e:
+            last_err = f"{model_name}: {str(e)}"
             continue
-    return CommitteeOutput(selected_trades=[])
+    return CommitteeOutput(selected_trades=[]), f"GEMINI_ERROR: {last_err}"
 
 
 async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: bool = False):
@@ -311,21 +335,29 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
         return {"status": "LOSS_HALT", "today_pnl": today_realized_pnl, "cash": cash_balance}
 
     if current_ist.time() >= ENTRY_CUTOFF_TIME or is_eod:
+        log_agent_msg(msg_ws, cycle_id, "RISK_GUARD", "ALL", "EOD_CUTOFF",
+                      "Past 02:30 PM IST entry cutoff. Monitoring exits only.", {})
         return {"status": "EOD_CUTOFF_MONITORING", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
 
-    if metrics_df.empty or len(open_symbols) >= MAX_CONCURRENT_TRADES:
+    if metrics_df.empty:
+        log_agent_msg(msg_ws, cycle_id, "DATA_FUNNEL", "ALL", "FETCH_EMPTY",
+                      "0 stocks fetched from Yahoo Finance (check rate-limit or market holiday).", {})
+        return {"status": "NO_MARKET_DATA", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
+
+    if len(open_symbols) >= MAX_CONCURRENT_TRADES:
         return {"status": "ACTIVE_POSITIONS_RUNNING", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
 
+    # 5. Quantitative Momentum Funnel (AG1, AG2, AG3)
     avail_df = metrics_df[~metrics_df["symbol"].isin(open_symbols)].copy()
-    ag1_df = avail_df[(avail_df["ltp"] > avail_df["vwap"]) & (avail_df["ema9"] > avail_df["ema20"]) & (avail_df["rsi14"].between(50, 66))].sort_values("rvol", ascending=False).head(2)
-    ag2_df = avail_df[(avail_df["ltp"] > avail_df["vwap"]) & (avail_df["day_chg_pct"].between(0.8, 3.2)) & (avail_df["rsi14"].between(55, 72))].sort_values("rvol", ascending=False).head(2)
-    ag3_df = avail_df[(avail_df["rvol"] >= 1.8) & (avail_df["day_chg_pct"] >= 1.2) & (avail_df["rsi14"] <= 75)].sort_values("rvol", ascending=False).head(2)
+    ag1_df = avail_df[(avail_df["ltp"] > avail_df["vwap"]) & (avail_df["ema9"] > avail_df["ema20"]) & (avail_df["rsi14"].between(48, 68))].sort_values("rvol", ascending=False).head(2)
+    ag2_df = avail_df[(avail_df["ltp"] > avail_df["vwap"]) & (avail_df["day_chg_pct"].between(0.5, 3.5)) & (avail_df["rsi14"].between(52, 74))].sort_values("rvol", ascending=False).head(2)
+    ag3_df = avail_df[(avail_df["rvol"] >= 1.3) & (avail_df["day_chg_pct"] >= 0.8) & (avail_df["rsi14"] <= 76)].sort_values("rvol", ascending=False).head(2)
 
     committee_payload = {}
     for tier_name, sub_df, atr_mult, rr_mult in [
-        ("LOW", ag1_df, 1.5, 2.2),
-        ("MID", ag2_df, 1.8, 2.4),
-        ("HIGH", ag3_df, 1.3, 2.5),
+        ("LOW", ag1_df, 1.5, 2.0),
+        ("MID", ag2_df, 1.8, 2.2),
+        ("HIGH", ag3_df, 1.3, 2.4),
     ]:
         for _, r in sub_df.iterrows():
             sl = round(r["ltp"] - (atr_mult * r["atr5m"]), 2)
@@ -343,9 +375,17 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
             }
 
     if not committee_payload:
+        log_agent_msg(msg_ws, cycle_id, "QUANT_FUNNEL", "AG4_AUDITOR", "NO_SETUPS",
+                      f"Scanned {len(metrics_df)} stocks; 0 met VWAP/EMA/RVOL entry thresholds.", {})
         return {"status": "NO_SETUPS", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
 
-    decision_out = await run_gemini_committee(gemini_api_key, committee_payload, total_today_pnl, locked_floor)
+    # 6. AG4 Chief Analyst Approval
+    decision_out, model_status = await run_gemini_committee(gemini_api_key, committee_payload, total_today_pnl, locked_floor)
+    log_agent_msg(
+        msg_ws, cycle_id, "AG4_AUDITOR", "AG5_BROKER", "COMMITTEE_REVIEW",
+        f"Scanned {len(metrics_df)} stocks -> {len(committee_payload)} candidates | {model_status} | Decisions: {len(decision_out.selected_trades)}",
+        {"candidates": list(committee_payload.keys()), "decisions": [d.model_dump() for d in decision_out.selected_trades]}
+    )
 
     if locked_floor >= MIN_DAILY_PROFIT_FLOOR:
         excess_cushion = max(0.0, total_today_pnl - locked_floor)
@@ -358,8 +398,9 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
     buying_power = cash_balance * INTRADAY_LEVERAGE
     max_per_stock_exposure = buying_power / MAX_CONCURRENT_TRADES
 
+    executed_count = 0
     for trade in decision_out.selected_trades:
-        if trade.action != "BUY" or trade.conviction < 65 or trade.symbol in open_symbols:
+        if trade.action != "BUY" or trade.conviction < 60 or trade.symbol in open_symbols:
             continue
         if len(open_symbols) >= MAX_CONCURRENT_TRADES:
             break
@@ -391,8 +432,17 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
             trade.reasoning
         ])
         open_symbols.add(trade.symbol)
+        executed_count += 1
         log_agent_msg(msg_ws, cycle_id, "AG5_BROKER", "TERMINAL", "BUY_EXECUTED",
                       f"Intraday BUY {qty} x {trade.symbol} @ ₹{entry} | SL: ₹{sl} | Target: ₹{target} | Active Floor: ₹{locked_floor}",
                       trade.model_dump())
 
-    return {"status": "CYCLE_COMPLETE", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
+    return {
+        "status": "CYCLE_COMPLETE",
+        "scanned": len(metrics_df),
+        "candidates": len(committee_payload),
+        "executed": executed_count,
+        "today_pnl": total_today_pnl,
+        "locked_floor": locked_floor,
+        "cash": cash_balance
+    }
