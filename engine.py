@@ -15,7 +15,12 @@ from google.genai import types
 from schemas import CommitteeOutput
 
 IST = timezone(timedelta(hours=5, minutes=30))
-CANDIDATE_MODELS = ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]
+CANDIDATE_MODELS = [
+    "gemini-2.5-flash",
+    "gemini-flash-latest",
+    "gemini-2.5-pro",
+    "gemini-pro-latest",
+]
 SHEET_NAME = "NSE_Intraday_1L_Ledger"
 
 # --- INTRADAY ₹1,00,000 CONFIGURATION (₹2,000 MINIMUM FLOOR) ---
@@ -216,8 +221,19 @@ async def run_gemini_committee(api_key: str, candidates: dict, current_pnl: floa
     3. Provide clear conviction (0-100) and concise reasoning for every candidate.
     """
 
+    models_to_try = list(CANDIDATE_MODELS)
+
+    # Auto-discover active models on this API key in case hardcoded aliases change
+    try:
+        async for m in await client.aio.models.list():
+            m_name = m.name.replace("models/", "")
+            if "flash" in m_name and "embedding" not in m_name and m_name not in models_to_try:
+                models_to_try.append(m_name)
+    except Exception:
+        pass
+
     last_err = ""
-    for model_name in CANDIDATE_MODELS:
+    for model_name in models_to_try:
         try:
             response = await client.aio.models.generate_content(
                 model=model_name,
