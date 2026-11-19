@@ -1,10 +1,12 @@
 import os
 import json
+import math
 import asyncio
 import time as pytime
 from datetime import datetime, timezone, timedelta, time
 import pandas as pd
 import numpy as np
+from scipy.stats import norm
 import yfinance as yf
 from curl_cffi import requests as curl_requests
 import feedparser
@@ -12,7 +14,7 @@ import gspread
 from google.oauth2.service_account import Credentials
 from google import genai
 from google.genai import types
-from schemas import CommitteeOutput
+from schemas import UnifiedCommitteeOutput
 
 IST = timezone(timedelta(hours=5, minutes=30))
 CANDIDATE_MODELS = [
@@ -21,23 +23,32 @@ CANDIDATE_MODELS = [
     "gemini-2.5-pro",
     "gemini-pro-latest",
 ]
-SHEET_NAME = "NSE_Intraday_1L_Ledger"
+SHEET_NAME = "NSE_Unified_2L_Ledger"
 
-# --- INTRADAY ₹1,00,000 CONFIGURATION (₹2,000 MINIMUM FLOOR) ---
-INITIAL_CAPITAL = 100000.0
-INTRADAY_LEVERAGE = 5.0           # 5x MIS margin = ₹5,00,000 buying power
-MIN_DAILY_PROFIT_FLOOR = 2000.0   # Minimum profit locked once crossed
-TRAIL_RETENTION_RATIO = 0.75      # Locks 75% of profits earned above ₹2,000
-DAILY_MAX_LOSS = -1500.0          # Hard daily drawdown protection
-MAX_CONCURRENT_TRADES = 3
+# --- RING-FENCED CAPITAL & RISK CONFIGURATION (₹2,00,000 TOTAL) ---
+INIT_EQ_CAPITAL = 100000.0        # Book A: Intraday MIS Equities
+INIT_FNO_CAPITAL = 100000.0       # Book B: Intraday Index Options (NIFTY / BANKNIFTY)
+EQ_INTRADAY_LEVERAGE = 5.0        # 5x MIS margin = ₹5,00,000 Equity buying power
+
+COMBINED_PROFIT_FLOOR = 4000.0    # Combined ₹4,000 minimum profit floor (2.0% on ₹2L)
+TRAIL_RETENTION_RATIO = 0.75      # Locks 75% of excess profits above ₹4,000
+EQ_DAILY_MAX_LOSS = -1500.0       # Book A daily circuit breaker
+FNO_DAILY_MAX_LOSS = -2000.0      # Book B daily circuit breaker
+
+MAX_EQ_POSITIONS = 3
+MAX_FNO_POSITIONS = 2
+
 ENTRY_CUTOFF_TIME = time(14, 30)  # No new entries after 02:30 PM IST
-EOD_SQUAREOFF_TIME = time(15, 15) # Force close all positions at 03:15 PM IST
-ESTIMATED_BROKERAGE_PCT = 0.0006  # ~0.06% round-trip STT + brokerage + GST buffer
+EXPIRY_NAKED_CUTOFF = time(13, 30)# No naked option buying after 01:30 PM on Tuesday expiry
+EOD_SQUAREOFF_TIME = time(15, 15) # Mandatory square-off at 03:15 PM IST
 
-EXPECTED_TRADE_HEADERS = [
-    "timestamp", "date", "symbol", "tier", "status", "qty",
-    "entry", "sl", "target", "exit_price", "pnl", "reasoning"
-]
+EQ_BROKERAGE_PCT = 0.0006         # ~0.06% round-trip equity MIS charges
+FNO_FLAT_ORDER_COST = 55.0        # ~₹40 brokerage + STT/exchange/GST per round-trip lot group
+
+INDEX_SPECS = {
+    "NIFTY": {"yf_ticker": "^NSEI", "lot_size": 65, "strike_step": 50},
+    "BANKNIFTY": {"yf_ticker": "^NSEBANK", "lot_size": 30, "strike_step": 100},
+}
 
 LIQUID_INTRADAY_UNIVERSE = [
     "RELIANCE.NS", "TCS.NS", "HDFCBANK.NS", "BHARTIARTL.NS", "ICICIBANK.NS",
@@ -51,6 +62,14 @@ LIQUID_INTRADAY_UNIVERSE = [
     "RVNL.NS", "MAZDOCK.NS", "BHEL.NS", "SAIL.NS", "VEDL.NS", "POLYCAB.NS",
     "DIXON.NS", "ABB.NS", "CGPOWER.NS", "SUZLON.NS", "TATAPOWER.NS", "PERSISTENT.NS",
     "COFORGE.NS", "KPITTECH.NS", "NAUKRI.NS", "IRCTC.NS", "JIOFIN.NS"
+]
+
+EXPECTED_ACCOUNT_HEADERS = [
+    "active_date", "eq_cash", "fno_cash", "combined_peak_pnl", "locked_floor"
+]
+EXPECTED_TRADE_HEADERS = [
+    "timestamp", "date", "book", "symbol", "strategy", "status",
+    "qty_or_lots", "lot_size", "entry", "sl", "target", "exit_price", "net_pnl", "reasoning"
 ]
 
 
@@ -73,31 +92,32 @@ def init_or_load_ledger(client, today_str: str):
     trades_ws = sh.worksheet("trades")
     msg_ws = sh.worksheet("agent_messages")
 
-    # Enforce exact 12-column schema in trades worksheet so columns never shift
+    if acc_ws.row_values(1) != EXPECTED_ACCOUNT_HEADERS:
+        acc_ws.update("A1:E1", [EXPECTED_ACCOUNT_HEADERS])
     if trades_ws.row_values(1) != EXPECTED_TRADE_HEADERS:
-        trades_ws.update("A1:L1", [EXPECTED_TRADE_HEADERS])
+        trades_ws.update("A1:N1", [EXPECTED_TRADE_HEADERS])
 
     row_vals = acc_ws.row_values(2)
-    cash_balance = float(row_vals[0]) if len(row_vals) >= 1 and row_vals[0] else INITIAL_CAPITAL
-    stored_date = row_vals[1] if len(row_vals) >= 2 else ""
-    peak_daily_pnl = float(row_vals[2]) if len(row_vals) >= 3 and row_vals[2] else 0.0
-    locked_floor = float(row_vals[3]) if len(row_vals) >= 4 and row_vals[3] else 0.0
+    stored_date = row_vals[0] if len(row_vals) >= 1 else ""
+    eq_cash = float(row_vals[1]) if len(row_vals) >= 2 and row_vals[1] else INIT_EQ_CAPITAL
+    fno_cash = float(row_vals[2]) if len(row_vals) >= 3 and row_vals[2] else INIT_FNO_CAPITAL
+    combined_peak_pnl = float(row_vals[3]) if len(row_vals) >= 4 and row_vals[3] else 0.0
+    locked_floor = float(row_vals[4]) if len(row_vals) >= 5 and row_vals[4] else 0.0
 
     if stored_date != today_str:
-        peak_daily_pnl = 0.0
+        combined_peak_pnl = 0.0
         locked_floor = 0.0
-        acc_ws.update("A1:D2", [
-            ["cash_balance", "active_date", "peak_daily_pnl", "locked_floor"],
-            [cash_balance, today_str, peak_daily_pnl, locked_floor]
-        ])
+        acc_ws.update("A2:E2", [[today_str, eq_cash, fno_cash, combined_peak_pnl, locked_floor]])
 
     trades_records = trades_ws.get_all_records()
     trades_df = pd.DataFrame(trades_records) if trades_records else pd.DataFrame(columns=EXPECTED_TRADE_HEADERS)
-    return sh, acc_ws, trades_ws, msg_ws, cash_balance, peak_daily_pnl, locked_floor, trades_df
+    return sh, acc_ws, trades_ws, msg_ws, eq_cash, fno_cash, combined_peak_pnl, locked_floor, trades_df
 
 
-def sync_account_state(acc_ws, cash_balance: float, today_str: str, peak_daily_pnl: float, locked_floor: float):
-    acc_ws.update("A2:D2", [[round(cash_balance, 2), today_str, round(peak_daily_pnl, 2), round(locked_floor, 2)]])
+def sync_account_state(acc_ws, today_str: str, eq_cash: float, fno_cash: float, peak_pnl: float, locked_floor: float):
+    acc_ws.update("A2:E2", [[
+        today_str, round(eq_cash, 2), round(fno_cash, 2), round(peak_pnl, 2), round(locked_floor, 2)
+    ]])
 
 
 def log_agent_msg(msg_ws, cycle_id: str, sender: str, recipient: str, msg_type: str, summary: str, payload: dict):
@@ -115,24 +135,157 @@ def log_agent_msg(msg_ws, cycle_id: str, sender: str, recipient: str, msg_type: 
         pass
 
 
-def fetch_intraday_metrics(tickers: list[str]) -> pd.DataFrame:
-    session = curl_requests.Session(impersonate="chrome")
-    today_str = now_ist().strftime("%Y-%m-%d")
-    rows = []
+# --- BLACK-SCHOLES GREEKS & SYNTHETIC/LIVE OPTION CHAIN PRICER ---
+def bs_option_metrics(spot: float, strike: float, dte_days: float, iv: float, opt_type: str, r: float = 0.065):
+    T = max(dte_days / 365.0, 1.0 / (365.0 * 24.0))
+    sigma = max(iv, 0.08)
+    d1 = (math.log(spot / strike) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if opt_type == "CE":
+        price = spot * norm.cdf(d1) - strike * math.exp(-r * T) * norm.cdf(d2)
+        delta = norm.cdf(d1)
+    else:
+        price = strike * math.exp(-r * T) * norm.cdf(-d2) - spot * norm.cdf(-d1)
+        delta = norm.cdf(d1) - 1.0
+    theta = -(spot * norm.pdf(d1) * sigma) / (2.0 * math.sqrt(T) * 365.0)
+    return round(max(price, 1.5), 2), round(delta, 3), round(theta, 2)
 
+
+def fetch_nse_option_chain_live(session, symbol: str) -> dict:
+    """Attempts direct NSE Option Chain fetch via curl_cffi; returns empty dict if NSE blocks cloud IP."""
+    try:
+        session.get("https://www.nseindia.com/option-chain", timeout=6)
+        url = f"https://www.nseindia.com/api/option-chain-indices?symbol={symbol}"
+        resp = session.get(url, headers={"Accept": "application/json", "Referer": "https://www.nseindia.com/option-chain"}, timeout=6)
+        if resp.status_code == 200:
+            data = resp.json()
+            records = data.get("records", {})
+            filtered = data.get("filtered", {})
+            tot_ce_oi = filtered.get("CE", {}).get("totOI", 0)
+            tot_pe_oi = filtered.get("PE", {}).get("totOI", 0)
+            pcr = round(tot_pe_oi / max(tot_ce_oi, 1), 2)
+            return {"source": "NSE_LIVE", "pcr": pcr, "expiry_dates": records.get("expiryDates", [])[:2], "data": filtered.get("data", [])}
+    except Exception:
+        pass
+    return {}
+
+
+def fetch_index_fno_context(session, current_ist: datetime) -> dict:
+    """Fetches NIFTY, BANKNIFTY, and INDIA VIX intraday metrics + live/BS-calibrated option strikes."""
+    tickers = ["^NSEI", "^NSEBANK", "^INDIAVIX"]
+    raw = yf.download(tickers, period="5d", interval="5m", group_by="ticker", progress=False, threads=False, session=session)
+    today_str = current_ist.strftime("%Y-%m-%d")
+
+    vix_val = 14.5
+    try:
+        vdf = raw["^INDIAVIX"].dropna()
+        if not vdf.empty:
+            vix_val = round(float(vdf["Close"].iloc[-1]), 2)
+    except Exception:
+        pass
+
+    # Days to next Tuesday expiry (weekday 1 = Tuesday)
+    days_ahead = (1 - current_ist.weekday()) % 7
+    dte_days = max(0.25, float(days_ahead) if days_ahead > 0 else 0.35)
+    is_tuesday_expiry = (current_ist.weekday() == 1)
+
+    fno_summary = {
+        "india_vix": vix_val,
+        "is_tuesday_expiry": is_tuesday_expiry,
+        "dte_days": dte_days,
+        "indices": {},
+        "live_option_ltps": {}
+    }
+
+    for idx_name, spec in INDEX_SPECS.items():
+        try:
+            df = raw[spec["yf_ticker"]].dropna()
+            if df.empty or len(df) < 15:
+                continue
+            if df.index.tz is None:
+                df.index = df.index.tz_localize("UTC").tz_convert(IST)
+            else:
+                df.index = df.index.tz_convert(IST)
+
+            today_df = df[df.index.strftime("%Y-%m-%d") == today_str]
+            if today_df.empty:
+                today_df = df.tail(75)
+
+            spot = round(float(today_df["Close"].iloc[-1]), 2)
+            day_open = float(today_df["Open"].iloc[0])
+            ema9 = round(float(df["Close"].ewm(span=9, adjust=False).mean().iloc[-1]), 2)
+            ema20 = round(float(df["Close"].ewm(span=20, adjust=False).mean().iloc[-1]), 2)
+
+            delta_s = df["Close"].diff()
+            gain = delta_s.clip(lower=0).rolling(14).mean()
+            loss = (-delta_s.clip(upper=0)).rolling(14).mean()
+            rsi14 = round(float((100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).iloc[-1]), 2)
+
+            step = spec["strike_step"]
+            atm_strike = int(round(spot / step) * step)
+            otm_ce_strike = atm_strike + (3 * step)
+            otm_pe_strike = atm_strike - (3 * step)
+
+            # Try NSE live chain first; calibrate with Black-Scholes + VIX if cloud IP is blocked
+            nse_chain = fetch_nse_option_chain_live(session, idx_name)
+            iv_decimal = max(vix_val / 100.0, 0.11)
+            pcr = nse_chain.get("pcr", round(1.0 + ((spot - ema20) / max(spot, 1)) * 15, 2))
+
+            ce_ltp, ce_delta, ce_theta = bs_option_metrics(spot, atm_strike, dte_days, iv_decimal, "CE")
+            pe_ltp, pe_delta, pe_theta = bs_option_metrics(spot, atm_strike, dte_days, iv_decimal, "PE")
+            otm_ce_ltp, _, _ = bs_option_metrics(spot, otm_ce_strike, dte_days, iv_decimal, "CE")
+            otm_pe_ltp, _, _ = bs_option_metrics(spot, otm_pe_strike, dte_days, iv_decimal, "PE")
+
+            # Override with exact NSE LTPs if live chain succeeded
+            for item in nse_chain.get("data", []):
+                st_px = item.get("strikePrice")
+                if st_px == atm_strike:
+                    if item.get("CE", {}).get("lastPrice"):
+                        ce_ltp = float(item["CE"]["lastPrice"])
+                    if item.get("PE", {}).get("lastPrice"):
+                        pe_ltp = float(item["PE"]["lastPrice"])
+                elif st_px == otm_ce_strike and item.get("CE", {}).get("lastPrice"):
+                    otm_ce_ltp = float(item["CE"]["lastPrice"])
+                elif st_px == otm_pe_strike and item.get("PE", {}).get("lastPrice"):
+                    otm_pe_ltp = float(item["PE"]["lastPrice"])
+
+            ce_label = f"{idx_name} {atm_strike} CE"
+            pe_label = f"{idx_name} {atm_strike} PE"
+            bull_spread_label = f"{idx_name} {atm_strike}/{otm_ce_strike} BULL_CALL_SPREAD"
+            bear_spread_label = f"{idx_name} {atm_strike}/{otm_pe_strike} BEAR_PUT_SPREAD"
+
+            fno_summary["live_option_ltps"][ce_label] = ce_ltp
+            fno_summary["live_option_ltps"][pe_label] = pe_ltp
+            fno_summary["live_option_ltps"][bull_spread_label] = round(max(ce_ltp - otm_ce_ltp, 5.0), 2)
+            fno_summary["live_option_ltps"][bear_spread_label] = round(max(pe_ltp - otm_pe_ltp, 5.0), 2)
+
+            fno_summary["indices"][idx_name] = {
+                "spot": spot,
+                "day_chg_pct": round(((spot - day_open) / day_open) * 100, 2),
+                "ema9": ema9,
+                "ema20": ema20,
+                "rsi14": rsi14,
+                "pcr": pcr,
+                "lot_size": spec["lot_size"],
+                "atm_strike": atm_strike,
+                "atm_ce": {"symbol": ce_label, "ltp": ce_ltp, "delta": ce_delta, "theta": ce_theta},
+                "atm_pe": {"symbol": pe_label, "ltp": pe_ltp, "delta": pe_delta, "theta": pe_theta},
+                "bull_call_spread": {"symbol": bull_spread_label, "long_strike": atm_strike, "short_strike": otm_ce_strike, "net_debit": round(max(ce_ltp - otm_ce_ltp, 5.0), 2)},
+                "bear_put_spread": {"symbol": bear_spread_label, "long_strike": atm_strike, "short_strike": otm_pe_strike, "net_debit": round(max(pe_ltp - otm_pe_ltp, 5.0), 2)},
+            }
+        except Exception:
+            continue
+
+    return fno_summary
+
+
+def fetch_equity_metrics(session, tickers: list[str], today_str: str) -> pd.DataFrame:
+    rows = []
     chunk_size = 20
     for i in range(0, len(tickers), chunk_size):
         batch = tickers[i:i + chunk_size]
         try:
-            raw = yf.download(
-                batch,
-                period="5d",
-                interval="5m",
-                group_by="ticker",
-                progress=False,
-                threads=False,
-                session=session
-            )
+            raw = yf.download(batch, period="5d", interval="5m", group_by="ticker", progress=False, threads=False, session=session)
         except Exception:
             continue
 
@@ -141,7 +294,6 @@ def fetch_intraday_metrics(tickers: list[str]) -> pd.DataFrame:
                 df = raw[sym].dropna() if len(batch) > 1 else raw.dropna()
                 if df.empty or len(df) < 20:
                     continue
-
                 if df.index.tz is None:
                     df.index = df.index.tz_localize("UTC").tz_convert(IST)
                 else:
@@ -158,7 +310,6 @@ def fetch_intraday_metrics(tickers: list[str]) -> pd.DataFrame:
 
                 tp = (today_df["High"] + today_df["Low"] + today_df["Close"]) / 3.0
                 vwap = float((tp * today_df["Volume"]).sum() / max(today_df["Volume"].sum(), 1))
-
                 close_s = df["Close"]
                 ema9 = float(close_s.ewm(span=9, adjust=False).mean().iloc[-1])
                 ema20 = float(close_s.ewm(span=20, adjust=False).mean().iloc[-1])
@@ -166,8 +317,7 @@ def fetch_intraday_metrics(tickers: list[str]) -> pd.DataFrame:
                 delta = close_s.diff()
                 gain = delta.clip(lower=0).rolling(14).mean()
                 loss = (-delta.clip(upper=0)).rolling(14).mean()
-                rs = gain / loss.replace(0, np.nan)
-                rsi14 = float((100 - (100 / (1 + rs))).iloc[-1])
+                rsi14 = float((100 - (100 / (1 + (gain / loss.replace(0, np.nan))))).iloc[-1])
 
                 tr = pd.concat([
                     df["High"] - df["Low"],
@@ -194,7 +344,7 @@ def fetch_intraday_metrics(tickers: list[str]) -> pd.DataFrame:
                 })
             except Exception:
                 continue
-        pytime.sleep(0.8)
+        pytime.sleep(0.6)
 
     return pd.DataFrame(rows)
 
@@ -206,30 +356,41 @@ def fetch_stock_news(symbol: str) -> list[str]:
     return [entry.title for entry in feed.entries[:3]]
 
 
-async def run_gemini_committee(api_key: str, candidates: dict, current_pnl: float, locked_floor: float) -> tuple[CommitteeOutput, str]:
+async def run_unified_gemini_committee(
+    api_key: str,
+    eq_candidates: dict,
+    fno_context: dict,
+    combined_pnl: float,
+    locked_floor: float,
+    allow_eq: bool,
+    allow_fno: bool,
+    naked_fno_allowed: bool
+) -> tuple[UnifiedCommitteeOutput, str]:
     client = genai.Client(api_key=api_key)
-    mode_note = (
-        f"HOUSE-MONEY EXPANSION MODE: We have already secured our ₹{locked_floor:.2f} minimum profit floor (Current P&L: ₹{current_pnl:.2f}). Approve strong momentum continuations with tight stop-losses."
-        if locked_floor >= MIN_DAILY_PROFIT_FLOOR else
-        f"BASE TARGET MODE: Current P&L is ₹{current_pnl:.2f}. Select high-probability intraday momentum setups to cross our ₹2,000 minimum daily profit floor."
-    )
 
     prompt = f"""
-    You are AG4 (Chief Intraday Trading Auditor) for an NSE India ₹1,00,000 intraday trading desk.
-    {mode_note}
-    All trades MUST close before 03:15 PM IST today.
+    You are AG4 (Chief Multi-Asset Trading Auditor) managing a ₹2,00,000 NSE Intraday Desk split into:
+    - Book A (₹1,00,000 Equity MIS): Allowed = {allow_eq}
+    - Book B (₹1,00,000 Index Options NIFTY/BANKNIFTY): Allowed = {allow_fno} | Naked Option Buying Allowed = {naked_fno_allowed}
 
-    Review these intraday momentum setups selected by AG1 (VWAP Steady), AG2 (EMA Breakout), and AG3 (High-RVOL Scalper):
-    {json.dumps(candidates, indent=2)}
+    Current Combined Today P&L: ₹{combined_pnl:.2f} | Combined Minimum Profit Floor Target: ₹{COMBINED_PROFIT_FLOOR:.2f} | Active Locked Floor: ₹{locked_floor:.2f}.
+    All positions MUST close before 03:15 PM IST today.
+
+    EQUITY CANDIDATES (Book A):
+    {json.dumps(eq_candidates, indent=2)}
+
+    INDEX F&O CONTEXT & LIVE OPTION CHAINS (Book B):
+    {json.dumps(fno_context, indent=2)}
 
     Rules:
-    1. Approve 1 to 3 highest-probability BUY setups with Risk-to-Reward >= 1:1.6. Set entry_price = ltp, stop_loss = suggested_sl, target_price = suggested_target.
-    2. Veto (SKIP) any stock ONLY if it has NEGATIVE_RISK news or extreme overbought RSI > 78.
-    3. Provide clear conviction (0-100) and concise reasoning for every candidate.
+    1. For Book A (Equity): Approve up to 2 highest-conviction BUY setups (R:R >= 1:1.6, conviction >= 60). Veto NEGATIVE_RISK news or RSI > 78.
+    2. For Book B (Index F&O): Approve up to 2 NIFTY or BANKNIFTY setups (conviction >= 65).
+       - If spot > ema9 > ema20 and RSI 52-70: select Bullish CE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bull_call_spread).
+       - If spot < ema9 < ema20 and RSI 30-48: select Bearish PE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bear_put_spread).
+       - Set entry_premium = exact ltp/net_debit from the F&O context, sl_premium = entry_premium * 0.75 (-25% SL), target_premium = entry_premium * 1.45 (+45% target).
     """
 
     models_to_try = list(CANDIDATE_MODELS)
-
     try:
         async for m in await client.aio.models.list():
             m_name = m.name.replace("models/", "")
@@ -246,78 +407,106 @@ async def run_gemini_committee(api_key: str, candidates: dict, current_pnl: floa
                 contents=prompt,
                 config=types.GenerateContentConfig(
                     response_mime_type="application/json",
-                    response_schema=CommitteeOutput,
+                    response_schema=UnifiedCommitteeOutput,
                     temperature=0.2,
                 ),
             )
-            return CommitteeOutput.model_validate_json(response.text), f"OK ({model_name})"
+            return UnifiedCommitteeOutput.model_validate_json(response.text), f"OK ({model_name})"
         except Exception as e:
             last_err = f"{model_name}: {str(e)}"
             continue
-    return CommitteeOutput(selected_trades=[]), f"GEMINI_ERROR: {last_err}"
+
+    fallback = UnifiedCommitteeOutput(
+        market_regime="RANGE_CHOP",
+        vix_assessment="Fallback due to API error",
+        equity_trades=[],
+        fno_trades=[]
+    )
+    return fallback, f"GEMINI_ERROR: {last_err}"
 
 
-async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: bool = False):
+async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: bool = False):
     current_ist = now_ist()
     today_str = current_ist.strftime("%Y-%m-%d")
     cycle_id = current_ist.strftime("%Y%m%d_%H%M%S")
 
     gc = get_gsheet_client(gcp_json)
-    sh, acc_ws, trades_ws, msg_ws, cash_balance, peak_daily_pnl, locked_floor, trades_df = init_or_load_ledger(gc, today_str)
+    sh, acc_ws, trades_ws, msg_ws, eq_cash, fno_cash, combined_peak_pnl, locked_floor, trades_df = init_or_load_ledger(gc, today_str)
 
-    metrics_df = fetch_intraday_metrics(LIQUID_INTRADAY_UNIVERSE)
-    ltp_map = dict(zip(metrics_df["symbol"], metrics_df["ltp"])) if not metrics_df.empty else {}
+    session = curl_requests.Session(impersonate="chrome")
+    eq_df = fetch_equity_metrics(session, LIQUID_INTRADAY_UNIVERSE, today_str)
+    fno_ctx = fetch_index_fno_context(session, current_ist)
 
-    today_realized_pnl = 0.0
+    eq_ltp_map = dict(zip(eq_df["symbol"], eq_df["ltp"])) if not eq_df.empty else {}
+    fno_ltp_map = fno_ctx.get("live_option_ltps", {})
+
+    # 1. Calculate Today's Realized P&L per Book
+    eq_realized_pnl = 0.0
+    fno_realized_pnl = 0.0
     if not trades_df.empty:
-        if "date" not in trades_df.columns:
-            trades_df["date"] = trades_df["timestamp"].astype(str).str[:10]
-        trades_df["pnl"] = pd.to_numeric(trades_df["pnl"], errors="coerce").fillna(0.0)
+        trades_df["net_pnl"] = pd.to_numeric(trades_df["net_pnl"], errors="coerce").fillna(0.0)
         trades_df["status_clean"] = trades_df["status"].astype(str).str.strip().str.upper()
-        today_closed = trades_df[(trades_df["date"] == today_str) & (trades_df["status_clean"] != "OPEN")]
-        today_realized_pnl = float(today_closed["pnl"].sum()) if not today_closed.empty else 0.0
+        trades_df["book_clean"] = trades_df["book"].astype(str).str.strip().str.upper()
+        closed_today = trades_df[(trades_df["date"].astype(str) == today_str) & (trades_df["status_clean"] != "OPEN")]
+        eq_realized_pnl = float(closed_today[closed_today["book_clean"] == "EQUITY"]["net_pnl"].sum())
+        fno_realized_pnl = float(closed_today[closed_today["book_clean"] == "FNO"]["net_pnl"].sum())
 
+    # 2. Evaluate Live Open Positions across Both Books
     all_records = trades_ws.get_all_records()
     open_rows = []
-    live_unrealized_pnl = 0.0
+    eq_unrealized = 0.0
+    fno_unrealized = 0.0
 
     for idx, row in enumerate(all_records, start=2):
-        status_clean = str(row.get("status", "")).strip().upper()
-        if status_clean == "OPEN":
+        if str(row.get("status", "")).strip().upper() == "OPEN":
+            book = str(row.get("book", "EQUITY")).strip().upper()
             sym = str(row["symbol"]).strip()
-            qty = int(float(row["qty"]))
+            qty_or_lots = int(float(row["qty_or_lots"]))
+            lot_size = int(float(row.get("lot_size", 1) or 1))
             entry = float(row["entry"])
-            sl = float(row["sl"])
-            target = float(row["target"])
-            cur_ltp = ltp_map.get(sym, entry)
 
-            net_mtm = round(((cur_ltp - entry) * qty) - ((entry + cur_ltp) * qty * ESTIMATED_BROKERAGE_PCT), 2)
-            live_unrealized_pnl += net_mtm
-            open_rows.append((idx, row, cur_ltp, net_mtm))
+            if book == "EQUITY":
+                cur_ltp = eq_ltp_map.get(sym, entry)
+                net_mtm = round(((cur_ltp - entry) * qty_or_lots) - ((entry + cur_ltp) * qty_or_lots * EQ_BROKERAGE_PCT), 2)
+                eq_unrealized += net_mtm
+            else:
+                cur_ltp = fno_ltp_map.get(sym, entry)
+                total_units = qty_or_lots * lot_size
+                net_mtm = round(((cur_ltp - entry) * total_units) - FNO_FLAT_ORDER_COST, 2)
+                fno_unrealized += net_mtm
 
-    total_today_pnl = round(today_realized_pnl + live_unrealized_pnl, 2)
+            open_rows.append((idx, row, book, cur_ltp, net_mtm))
 
-    if total_today_pnl > peak_daily_pnl:
-        peak_daily_pnl = total_today_pnl
+    eq_total_pnl = round(eq_realized_pnl + eq_unrealized, 2)
+    fno_total_pnl = round(fno_realized_pnl + fno_unrealized, 2)
+    combined_today_pnl = round(eq_total_pnl + fno_total_pnl, 2)
 
-    if peak_daily_pnl >= MIN_DAILY_PROFIT_FLOOR:
-        excess_above_2k = peak_daily_pnl - MIN_DAILY_PROFIT_FLOOR
-        computed_floor = round(MIN_DAILY_PROFIT_FLOOR + (excess_above_2k * TRAIL_RETENTION_RATIO), 2)
+    # 3. Update Combined Peak & ₹4,000 Trailing Profit Floor
+    if combined_today_pnl > combined_peak_pnl:
+        combined_peak_pnl = combined_today_pnl
+
+    if combined_peak_pnl >= COMBINED_PROFIT_FLOOR:
+        excess = combined_peak_pnl - COMBINED_PROFIT_FLOOR
+        computed_floor = round(COMBINED_PROFIT_FLOOR + (excess * TRAIL_RETENTION_RATIO), 2)
         locked_floor = max(locked_floor, computed_floor)
 
     is_eod = current_ist.time() >= EOD_SQUAREOFF_TIME or force_square_off
-    floor_breached = (locked_floor >= MIN_DAILY_PROFIT_FLOOR) and (total_today_pnl <= locked_floor)
-    daily_loss_breached = total_today_pnl <= DAILY_MAX_LOSS
+    floor_breached = (locked_floor >= COMBINED_PROFIT_FLOOR) and (combined_today_pnl <= locked_floor)
+    eq_loss_halted = eq_total_pnl <= EQ_DAILY_MAX_LOSS
+    fno_loss_halted = fno_total_pnl <= FNO_DAILY_MAX_LOSS
 
-    open_symbols = set()
-    for idx, row, cur_ltp, net_mtm in open_rows:
+    open_eq_symbols = set()
+    open_fno_symbols = set()
+
+    for idx, row, book, cur_ltp, net_mtm in open_rows:
         sym = str(row["symbol"]).strip()
-        qty = int(float(row["qty"]))
+        qty_or_lots = int(float(row["qty_or_lots"]))
+        lot_size = int(float(row.get("lot_size", 1) or 1))
         entry = float(row["entry"])
         sl = float(row["sl"])
         target = float(row["target"])
 
-        effective_sl = max(sl, round(entry * 1.001, 2)) if (locked_floor >= MIN_DAILY_PROFIT_FLOOR and cur_ltp > entry * 1.003) else sl
+        effective_sl = max(sl, round(entry * 1.002, 2)) if (locked_floor >= COMBINED_PROFIT_FLOOR and cur_ltp > entry * 1.005) else sl
 
         exit_reason = None
         exit_px = cur_ltp
@@ -325,9 +514,11 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
         if is_eod:
             exit_reason = "EOD_SQUAREOFF"
         elif floor_breached:
-            exit_reason = f"TRAILING_FLOOR_LOCK_{int(locked_floor)}"
-        elif daily_loss_breached:
-            exit_reason = "DAILY_MAX_LOSS_STOP"
+            exit_reason = f"COMBINED_FLOOR_LOCK_{int(locked_floor)}"
+        elif book == "EQUITY" and eq_loss_halted:
+            exit_reason = "EQ_DAILY_MAX_LOSS"
+        elif book == "FNO" and fno_loss_halted:
+            exit_reason = "FNO_DAILY_MAX_LOSS"
         elif cur_ltp <= effective_sl:
             exit_reason = "TRAILING_SL_HIT" if effective_sl > sl else "SL_HIT"
             exit_px = effective_sl
@@ -336,138 +527,137 @@ async def run_full_cycle(gemini_api_key: str, gcp_json: dict, force_square_off: 
             exit_px = target
 
         if exit_reason:
-            final_pnl = round(((exit_px - entry) * qty) - ((entry + exit_px) * qty * ESTIMATED_BROKERAGE_PCT), 2)
-            cash_balance = round(cash_balance + final_pnl, 2)
-            today_realized_pnl += final_pnl
-            trades_ws.update_cell(idx, 5, exit_reason)
-            trades_ws.update_cell(idx, 10, exit_px)
-            trades_ws.update_cell(idx, 11, final_pnl)
-            log_agent_msg(msg_ws, cycle_id, "AG5_BROKER", "ALL", "EXIT",
-                          f"Closed {sym} ({exit_reason}) @ ₹{exit_px} | Net P&L: ₹{final_pnl} | Floor: ₹{locked_floor}", row)
-        else:
-            open_symbols.add(sym)
-            if effective_sl > sl:
-                trades_ws.update_cell(idx, 8, effective_sl)
+            if book == "EQUITY":
+                final_pnl = round(((exit_px - entry) * qty_or_lots) - ((entry + exit_px) * qty_or_lots * EQ_BROKERAGE_PCT), 2)
+                eq_cash = round(eq_cash + final_pnl, 2)
+                eq_realized_pnl += final_pnl
+            else:
+                final_pnl = round(((exit_px - entry) * qty_or_lots * lot_size) - FNO_FLAT_ORDER_COST, 2)
+                fno_cash = round(fno_cash + final_pnl, 2)
+                fno_realized_pnl += final_pnl
 
-    sync_account_state(acc_ws, cash_balance, today_str, peak_daily_pnl, locked_floor)
+            trades_ws.update_cell(idx, 6, exit_reason)
+            trades_ws.update_cell(idx, 12, exit_px)
+            trades_ws.update_cell(idx, 13, final_pnl)
+            log_agent_msg(msg_ws, cycle_id, f"AG5_{book}", "ALL", "EXIT",
+                          f"[{book}] Closed {sym} ({exit_reason}) @ ₹{exit_px} | Net P&L: ₹{final_pnl}", row)
+        else:
+            if book == "EQUITY":
+                open_eq_symbols.add(sym)
+            else:
+                open_fno_symbols.add(sym)
+            if effective_sl > sl:
+                trades_ws.update_cell(idx, 10, effective_sl)
+
+    sync_account_state(acc_ws, today_str, eq_cash, fno_cash, combined_peak_pnl, locked_floor)
 
     if floor_breached:
-        log_agent_msg(msg_ws, cycle_id, "RISK_GUARD", "ALL", "FLOOR_SECURED",
-                      f"Trailing profit floor ₹{locked_floor:.2f} triggered! Day locked at ₹{today_realized_pnl:.2f}.", {})
-        return {"status": "PROFIT_FLOOR_LOCKED", "today_pnl": today_realized_pnl, "locked_floor": locked_floor, "cash": cash_balance}
-
-    if daily_loss_breached:
-        return {"status": "LOSS_HALT", "today_pnl": today_realized_pnl, "cash": cash_balance}
+        return {"status": "COMBINED_FLOOR_LOCKED", "combined_pnl": round(eq_realized_pnl + fno_realized_pnl, 2), "locked_floor": locked_floor}
 
     if current_ist.time() >= ENTRY_CUTOFF_TIME or is_eod:
-        log_agent_msg(msg_ws, cycle_id, "RISK_GUARD", "ALL", "EOD_CUTOFF",
-                      "Past 02:30 PM IST entry cutoff. Monitoring exits only.", {})
-        return {"status": "EOD_CUTOFF_MONITORING", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
+        return {"status": "EOD_CUTOFF_MONITORING", "eq_pnl": eq_total_pnl, "fno_pnl": fno_total_pnl}
 
-    if metrics_df.empty:
-        log_agent_msg(msg_ws, cycle_id, "DATA_FUNNEL", "ALL", "FETCH_EMPTY",
-                      "0 stocks fetched from Yahoo Finance (check rate-limit or market holiday).", {})
-        return {"status": "NO_MARKET_DATA", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
+    allow_eq = (not eq_loss_halted) and (len(open_eq_symbols) < MAX_EQ_POSITIONS) and (not eq_df.empty)
+    allow_fno = (not fno_loss_halted) and (len(open_fno_symbols) < MAX_FNO_POSITIONS) and bool(fno_ctx.get("indices"))
+    naked_fno_allowed = not (fno_ctx.get("is_tuesday_expiry") and current_ist.time() >= EXPIRY_NAKED_CUTOFF)
 
-    if len(open_symbols) >= MAX_CONCURRENT_TRADES:
-        return {"status": "ACTIVE_POSITIONS_RUNNING", "open_count": len(open_symbols), "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
+    if not allow_eq and not allow_fno:
+        return {"status": "BOOKS_AT_CAPACITY_OR_HALTED", "eq_open": len(open_eq_symbols), "fno_open": len(open_fno_symbols), "combined_pnl": combined_today_pnl}
 
-    # 5. Quantitative Momentum Funnel (AG1, AG2, AG3)
-    avail_df = metrics_df[~metrics_df["symbol"].isin(open_symbols)].copy()
-    ag1_df = avail_df[(avail_df["ltp"] > avail_df["vwap"]) & (avail_df["ema9"] > avail_df["ema20"]) & (avail_df["rsi14"].between(48, 68))].sort_values("rvol", ascending=False).head(2)
-    ag2_df = avail_df[(avail_df["ltp"] > avail_df["vwap"]) & (avail_df["day_chg_pct"].between(0.5, 3.5)) & (avail_df["rsi14"].between(52, 74))].sort_values("rvol", ascending=False).head(2)
-    ag3_df = avail_df[(avail_df["rvol"] >= 1.3) & (avail_df["day_chg_pct"] >= 0.8) & (avail_df["rsi14"] <= 76)].sort_values("rvol", ascending=False).head(2)
+    # 4. Build Equity Candidate Slate
+    eq_candidates = {}
+    if allow_eq:
+        avail_df = eq_df[~eq_df["symbol"].isin(open_eq_symbols)].copy()
+        ag1_df = avail_df[(avail_df["ltp"] > avail_df["vwap"]) & (avail_df["ema9"] > avail_df["ema20"]) & (avail_df["rsi14"].between(48, 68))].sort_values("rvol", ascending=False).head(2)
+        ag2_df = avail_df[(avail_df["ltp"] > avail_df["vwap"]) & (avail_df["day_chg_pct"].between(0.5, 3.5)) & (avail_df["rsi14"].between(52, 74))].sort_values("rvol", ascending=False).head(2)
+        ag3_df = avail_df[(avail_df["rvol"] >= 1.3) & (avail_df["day_chg_pct"] >= 0.8) & (avail_df["rsi14"] <= 76)].sort_values("rvol", ascending=False).head(2)
 
-    committee_payload = {}
-    for tier_name, sub_df, atr_mult, rr_mult in [
-        ("LOW", ag1_df, 1.5, 2.0),
-        ("MID", ag2_df, 1.8, 2.2),
-        ("HIGH", ag3_df, 1.3, 2.4),
-    ]:
-        for _, r in sub_df.iterrows():
-            sl = round(r["ltp"] - (atr_mult * r["atr5m"]), 2)
-            risk_per_share = max(r["ltp"] - sl, r["ltp"] * 0.003)
-            target = round(r["ltp"] + (risk_per_share * rr_mult), 2)
-            committee_payload[r["symbol"]] = {
-                "tier": tier_name,
-                "ltp": r["ltp"],
-                "vwap": r["vwap"],
-                "rsi14": r["rsi14"],
-                "rvol": r["rvol"],
-                "suggested_sl": sl,
-                "suggested_target": target,
-                "headlines": fetch_stock_news(r["symbol"])
-            }
+        for tier_name, sub_df, atr_mult, rr_mult in [("LOW", ag1_df, 1.5, 2.0), ("MID", ag2_df, 1.8, 2.2), ("HIGH", ag3_df, 1.3, 2.4)]:
+            for _, r in sub_df.iterrows():
+                sl = round(r["ltp"] - (atr_mult * r["atr5m"]), 2)
+                risk_sh = max(r["ltp"] - sl, r["ltp"] * 0.003)
+                target = round(r["ltp"] + (risk_sh * rr_mult), 2)
+                eq_candidates[r["symbol"]] = {
+                    "tier": tier_name, "ltp": r["ltp"], "vwap": r["vwap"], "rsi14": r["rsi14"],
+                    "rvol": r["rvol"], "suggested_sl": sl, "suggested_target": target,
+                    "headlines": fetch_stock_news(r["symbol"])
+                }
 
-    if not committee_payload:
-        log_agent_msg(msg_ws, cycle_id, "QUANT_FUNNEL", "AG4_AUDITOR", "NO_SETUPS",
-                      f"Scanned {len(metrics_df)} stocks; 0 met VWAP/EMA/RVOL entry thresholds.", {})
-        return {"status": "NO_SETUPS", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
-
-    # 6. AG4 Chief Analyst Approval
-    decision_out, model_status = await run_gemini_committee(gemini_api_key, committee_payload, total_today_pnl, locked_floor)
+    # 5. Unified Gemini Chief Analyst Review
+    decision_out, model_status = await run_unified_gemini_committee(
+        gemini_api_key, eq_candidates, fno_ctx, combined_today_pnl, locked_floor, allow_eq, allow_fno, naked_fno_allowed
+    )
     log_agent_msg(
-        msg_ws, cycle_id, "AG4_AUDITOR", "AG5_BROKER", "COMMITTEE_REVIEW",
-        f"Scanned {len(metrics_df)} stocks -> {len(committee_payload)} candidates | {model_status} | Decisions: {len(decision_out.selected_trades)}",
-        {"candidates": list(committee_payload.keys()), "decisions": [d.model_dump() for d in decision_out.selected_trades]}
+        msg_ws, cycle_id, "AG4_UNIFIED", "AG5_BROKER", "UNIFIED_REVIEW",
+        f"Regime: {decision_out.market_regime} | {model_status} | EQ Picks: {len(decision_out.equity_trades)} | F&O Picks: {len(decision_out.fno_trades)}",
+        decision_out.model_dump()
     )
 
-    if locked_floor >= MIN_DAILY_PROFIT_FLOOR:
-        excess_cushion = max(0.0, total_today_pnl - locked_floor)
-        max_trade_risk_rupees = excess_cushion * 0.50
-        if max_trade_risk_rupees < 200.0:
-            return {"status": "PROTECTING_FLOOR_NO_NEW_RISK", "today_pnl": total_today_pnl, "locked_floor": locked_floor, "cash": cash_balance}
-    else:
-        max_trade_risk_rupees = 550.0
+    # 6A. Execute Book A (Equity MIS) Orders
+    eq_exec_count = 0
+    eq_risk_budget = 550.0 if locked_floor < COMBINED_PROFIT_FLOOR else max(0.0, (combined_today_pnl - locked_floor) * 0.25)
+    eq_max_exposure = (eq_cash * EQ_INTRADAY_LEVERAGE) / MAX_EQ_POSITIONS
 
-    buying_power = cash_balance * INTRADAY_LEVERAGE
-    max_per_stock_exposure = buying_power / MAX_CONCURRENT_TRADES
+    if allow_eq and eq_risk_budget >= 150.0:
+        for t in decision_out.equity_trades:
+            if t.action != "BUY" or t.conviction < 60 or t.symbol in open_eq_symbols or len(open_eq_symbols) >= MAX_EQ_POSITIONS:
+                continue
+            risk_sh = max(t.entry_price - t.stop_loss, t.entry_price * 0.003)
+            qty = min(int(eq_risk_budget / risk_sh), int(eq_max_exposure / t.entry_price))
+            if qty <= 0:
+                continue
+            trades_ws.append_row([
+                current_ist.strftime("%Y-%m-%d %H:%M:%S"), today_str, "EQUITY", t.symbol, t.risk_tier,
+                "OPEN", qty, 1, t.entry_price, t.stop_loss, t.target_price, "", 0.0, t.reasoning
+            ])
+            open_eq_symbols.add(t.symbol)
+            eq_exec_count += 1
+            log_agent_msg(msg_ws, cycle_id, "AG5_EQUITY", "TERMINAL", "BUY_EXECUTED",
+                          f"[EQUITY] BUY {qty} x {t.symbol} @ ₹{t.entry_price} | SL: ₹{t.stop_loss} | Target: ₹{t.target_price}", t.model_dump())
 
-    executed_count = 0
-    for trade in decision_out.selected_trades:
-        if trade.action != "BUY" or trade.conviction < 60 or trade.symbol in open_symbols:
-            continue
-        if len(open_symbols) >= MAX_CONCURRENT_TRADES:
-            break
+    # 6B. Execute Book B (Index F&O) Orders
+    fno_exec_count = 0
+    fno_risk_budget = 1000.0 if locked_floor < COMBINED_PROFIT_FLOOR else max(0.0, (combined_today_pnl - locked_floor) * 0.35)
+    fno_max_capital_per_trade = fno_cash / MAX_FNO_POSITIONS
 
-        entry = trade.entry_price
-        sl = trade.stop_loss
-        target = trade.target_price
-        risk_per_share = max(entry - sl, entry * 0.003)
+    if allow_fno and fno_risk_budget >= 300.0:
+        for f in decision_out.fno_trades:
+            if f.action != "BUY" or f.conviction < 65 or f.contract_symbol in open_fno_symbols or len(open_fno_symbols) >= MAX_FNO_POSITIONS:
+                continue
+            if f.strategy_type == "SINGLE_LEG_BUY" and not naked_fno_allowed:
+                continue
 
-        qty_by_risk = int(max_trade_risk_rupees / risk_per_share)
-        qty_by_margin = int(max_per_stock_exposure / entry)
-        qty = min(qty_by_risk, qty_by_margin)
+            lot_sz = INDEX_SPECS.get(f.underlying, {}).get("lot_size", f.lot_size)
+            sl_points = max(f.entry_premium - f.sl_premium, f.entry_premium * 0.15)
+            risk_per_lot = sl_points * lot_sz
+            cost_per_lot = f.entry_premium * lot_sz
 
-        if qty <= 0:
-            continue
+            lots_by_risk = int(fno_risk_budget / max(risk_per_lot, 1.0))
+            lots_by_capital = int(fno_max_capital_per_trade / max(cost_per_lot, 1.0))
+            lots = min(lots_by_risk, lots_by_capital)
 
-        trades_ws.append_row([
-            current_ist.strftime("%Y-%m-%d %H:%M:%S"),
-            today_str,
-            trade.symbol,
-            trade.risk_tier,
-            "OPEN",
-            qty,
-            entry,
-            sl,
-            target,
-            "",
-            0.0,
-            trade.reasoning
-        ])
-        open_symbols.add(trade.symbol)
-        executed_count += 1
-        log_agent_msg(msg_ws, cycle_id, "AG5_BROKER", "TERMINAL", "BUY_EXECUTED",
-                      f"Intraday BUY {qty} x {trade.symbol} @ ₹{entry} | SL: ₹{sl} | Target: ₹{target} | Active Floor: ₹{locked_floor}",
-                      trade.model_dump())
+            # Allow at least 1 lot if total contract premium cost fits within ₹45,000
+            if lots <= 0 and cost_per_lot <= 45000.0 and risk_per_lot <= 1800.0:
+                lots = 1
+            if lots <= 0:
+                continue
+
+            trades_ws.append_row([
+                current_ist.strftime("%Y-%m-%d %H:%M:%S"), today_str, "FNO", f.contract_symbol, f.strategy_type,
+                "OPEN", lots, lot_sz, f.entry_premium, f.sl_premium, f.target_premium, "", 0.0, f.reasoning
+            ])
+            open_fno_symbols.add(f.contract_symbol)
+            fno_exec_count += 1
+            log_agent_msg(msg_ws, cycle_id, "AG5_FNO", "TERMINAL", "BUY_EXECUTED",
+                          f"[F&O] BUY {lots} Lot(s) ({lots*lot_sz} qty) {f.contract_symbol} @ ₹{f.entry_premium} | SL: ₹{f.sl_premium} | Target: ₹{f.target_premium}", f.model_dump())
 
     return {
-        "status": "CYCLE_COMPLETE",
-        "scanned": len(metrics_df),
-        "candidates": len(committee_payload),
-        "executed": executed_count,
-        "today_pnl": total_today_pnl,
-        "locked_floor": locked_floor,
-        "cash": cash_balance
+        "status": "UNIFIED_CYCLE_COMPLETE",
+        "regime": decision_out.market_regime,
+        "eq_executed": eq_exec_count,
+        "fno_executed": fno_exec_count,
+        "eq_pnl": eq_total_pnl,
+        "fno_pnl": fno_total_pnl,
+        "combined_pnl": combined_today_pnl,
+        "locked_floor": locked_floor
     }
