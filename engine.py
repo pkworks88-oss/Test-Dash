@@ -148,7 +148,8 @@ def bs_option_metrics(spot: float, strike: float, dte_days: float, iv: float, op
         price = strike * math.exp(-r * T) * norm.cdf(-d2) - spot * norm.cdf(-d1)
         delta = norm.cdf(d1) - 1.0
     theta = -(spot * norm.pdf(d1) * sigma) / (2.0 * math.sqrt(T) * 365.0)
-    return round(max(price, 1.5), 2), round(delta, 3), round(theta, 2)
+    vega = (spot * norm.pdf(d1) * math.sqrt(T)) / 100.0
+    return round(max(price, 1.5), 2), round(delta, 3), round(theta, 2), round(vega, 2)
 
 
 def fetch_nse_option_chain_live(session, symbol: str) -> dict:
@@ -170,8 +171,13 @@ def fetch_nse_option_chain_live(session, symbol: str) -> dict:
     return {}
 
 
-def fetch_index_fno_context(session, current_ist: datetime) -> dict:
-    """Fetches NIFTY, BANKNIFTY, and INDIA VIX intraday metrics + live/BS-calibrated option strikes."""
+def fetch_index_fno_context(session=None, current_ist: datetime = None) -> dict:
+    """Fetches NIFTY, BANKNIFTY, and INDIA VIX intraday metrics + 11-strike live/BS-calibrated option chain."""
+    if session is None:
+        session = curl_requests.Session(impersonate="chrome")
+    if current_ist is None:
+        current_ist = now_ist()
+
     tickers = ["^NSEI", "^NSEBANK", "^INDIAVIX"]
     raw = yf.download(tickers, period="5d", interval="5m", group_by="ticker", progress=False, threads=False, session=session)
     today_str = current_ist.strftime("%Y-%m-%d")
@@ -184,7 +190,6 @@ def fetch_index_fno_context(session, current_ist: datetime) -> dict:
     except Exception:
         pass
 
-    # Days to next Tuesday expiry (weekday 1 = Tuesday)
     days_ahead = (1 - current_ist.weekday()) % 7
     dte_days = max(0.25, float(days_ahead) if days_ahead > 0 else 0.35)
     is_tuesday_expiry = (current_ist.weekday() == 1)
@@ -226,28 +231,56 @@ def fetch_index_fno_context(session, current_ist: datetime) -> dict:
             otm_ce_strike = atm_strike + (3 * step)
             otm_pe_strike = atm_strike - (3 * step)
 
-            # Try NSE live chain first; calibrate with Black-Scholes + VIX if cloud IP is blocked
             nse_chain = fetch_nse_option_chain_live(session, idx_name)
             iv_decimal = max(vix_val / 100.0, 0.11)
             pcr = nse_chain.get("pcr", round(1.0 + ((spot - ema20) / max(spot, 1)) * 15, 2))
+            chain_source = nse_chain.get("source", "BS_VIX_CALIBRATED")
 
-            ce_ltp, ce_delta, ce_theta = bs_option_metrics(spot, atm_strike, dte_days, iv_decimal, "CE")
-            pe_ltp, pe_delta, pe_theta = bs_option_metrics(spot, atm_strike, dte_days, iv_decimal, "PE")
-            otm_ce_ltp, _, _ = bs_option_metrics(spot, otm_ce_strike, dte_days, iv_decimal, "CE")
-            otm_pe_ltp, _, _ = bs_option_metrics(spot, otm_pe_strike, dte_days, iv_decimal, "PE")
-
-            # Override with exact NSE LTPs if live chain succeeded
+            # Build 11-strike chain (-5 to +5 steps around ATM) for UI Option Chain Matrix
+            live_strikes_map = {}
             for item in nse_chain.get("data", []):
                 st_px = item.get("strikePrice")
-                if st_px == atm_strike:
-                    if item.get("CE", {}).get("lastPrice"):
-                        ce_ltp = float(item["CE"]["lastPrice"])
-                    if item.get("PE", {}).get("lastPrice"):
-                        pe_ltp = float(item["PE"]["lastPrice"])
-                elif st_px == otm_ce_strike and item.get("CE", {}).get("lastPrice"):
-                    otm_ce_ltp = float(item["CE"]["lastPrice"])
-                elif st_px == otm_pe_strike and item.get("PE", {}).get("lastPrice"):
-                    otm_pe_ltp = float(item["PE"]["lastPrice"])
+                if st_px:
+                    live_strikes_map[int(st_px)] = item
+
+            chain_table = []
+            for offset in range(-5, 6):
+                st_k = atm_strike + (offset * step)
+                c_ltp, c_del, c_the, c_veg = bs_option_metrics(spot, st_k, dte_days, iv_decimal, "CE")
+                p_ltp, p_del, p_the, p_veg = bs_option_metrics(spot, st_k, dte_days, iv_decimal, "PE")
+                c_oi = int(max(12000, 180000 * math.exp(-0.18 * abs(offset)) * (1.15 if offset > 0 else 0.85)))
+                p_oi = int(max(12000, 180000 * math.exp(-0.18 * abs(offset)) * (1.15 if offset < 0 else 0.85)))
+
+                if st_k in live_strikes_map:
+                    row_item = live_strikes_map[st_k]
+                    if row_item.get("CE", {}).get("lastPrice"):
+                        c_ltp = float(row_item["CE"]["lastPrice"])
+                    if row_item.get("PE", {}).get("lastPrice"):
+                        p_ltp = float(row_item["PE"]["lastPrice"])
+                    if row_item.get("CE", {}).get("openInterest"):
+                        c_oi = int(row_item["CE"]["openInterest"])
+                    if row_item.get("PE", {}).get("openInterest"):
+                        p_oi = int(row_item["PE"]["openInterest"])
+
+                chain_table.append({
+                    "CE_OI": c_oi, "CE_Delta": c_del, "CE_Theta": c_the, "CE_LTP": c_ltp,
+                    "Strike": st_k,
+                    "PE_LTP": p_ltp, "PE_Theta": p_the, "PE_Delta": p_del, "PE_OI": p_oi
+                })
+
+            ce_ltp, ce_delta, ce_theta, ce_vega = bs_option_metrics(spot, atm_strike, dte_days, iv_decimal, "CE")
+            pe_ltp, pe_delta, pe_theta, pe_vega = bs_option_metrics(spot, atm_strike, dte_days, iv_decimal, "PE")
+            otm_ce_ltp, _, _, _ = bs_option_metrics(spot, otm_ce_strike, dte_days, iv_decimal, "CE")
+            otm_pe_ltp, _, _, _ = bs_option_metrics(spot, otm_pe_strike, dte_days, iv_decimal, "PE")
+
+            # Override ATM / OTM with exact chain row values
+            for crow in chain_table:
+                if crow["Strike"] == atm_strike:
+                    ce_ltp, pe_ltp = crow["CE_LTP"], crow["PE_LTP"]
+                elif crow["Strike"] == otm_ce_strike:
+                    otm_ce_ltp = crow["CE_LTP"]
+                elif crow["Strike"] == otm_pe_strike:
+                    otm_pe_ltp = crow["PE_LTP"]
 
             ce_label = f"{idx_name} {atm_strike} CE"
             pe_label = f"{idx_name} {atm_strike} PE"
@@ -266,12 +299,15 @@ def fetch_index_fno_context(session, current_ist: datetime) -> dict:
                 "ema20": ema20,
                 "rsi14": rsi14,
                 "pcr": pcr,
+                "chain_source": chain_source,
                 "lot_size": spec["lot_size"],
+                "strike_step": step,
                 "atm_strike": atm_strike,
-                "atm_ce": {"symbol": ce_label, "ltp": ce_ltp, "delta": ce_delta, "theta": ce_theta},
-                "atm_pe": {"symbol": pe_label, "ltp": pe_ltp, "delta": pe_delta, "theta": pe_theta},
+                "atm_ce": {"symbol": ce_label, "ltp": ce_ltp, "delta": ce_delta, "theta": ce_theta, "vega": ce_vega},
+                "atm_pe": {"symbol": pe_label, "ltp": pe_ltp, "delta": pe_delta, "theta": pe_theta, "vega": pe_vega},
                 "bull_call_spread": {"symbol": bull_spread_label, "long_strike": atm_strike, "short_strike": otm_ce_strike, "net_debit": round(max(ce_ltp - otm_ce_ltp, 5.0), 2)},
                 "bear_put_spread": {"symbol": bear_spread_label, "long_strike": atm_strike, "short_strike": otm_pe_strike, "net_debit": round(max(pe_ltp - otm_pe_ltp, 5.0), 2)},
+                "chain_table": chain_table
             }
         except Exception:
             continue
@@ -279,7 +315,14 @@ def fetch_index_fno_context(session, current_ist: datetime) -> dict:
     return fno_summary
 
 
-def fetch_equity_metrics(session, tickers: list[str], today_str: str) -> pd.DataFrame:
+def fetch_equity_metrics(session=None, tickers: list[str] = None, today_str: str = None) -> pd.DataFrame:
+    if session is None:
+        session = curl_requests.Session(impersonate="chrome")
+    if tickers is None:
+        tickers = LIQUID_INTRADAY_UNIVERSE
+    if today_str is None:
+        today_str = now_ist().strftime("%Y-%m-%d")
+
     rows = []
     chunk_size = 20
     for i in range(0, len(tickers), chunk_size):
@@ -330,11 +373,13 @@ def fetch_equity_metrics(session, tickers: list[str], today_str: str) -> pd.Data
                 cur_vol = float(today_df["Volume"].iloc[-1])
                 rvol = round(cur_vol / max(avg_vol, 1), 2)
                 day_chg_pct = round(((ltp - day_open) / day_open) * 100, 2)
+                vwap_dist_pct = round(((ltp - vwap) / vwap) * 100, 2)
 
                 rows.append({
                     "symbol": sym,
                     "ltp": round(ltp, 2),
                     "vwap": round(vwap, 2),
+                    "vwap_dist_pct": vwap_dist_pct,
                     "ema9": round(ema9, 2),
                     "ema20": round(ema20, 2),
                     "rsi14": round(rsi14, 2),
@@ -344,7 +389,7 @@ def fetch_equity_metrics(session, tickers: list[str], today_str: str) -> pd.Data
                 })
             except Exception:
                 continue
-        pytime.sleep(0.6)
+        pytime.sleep(0.5)
 
     return pd.DataFrame(rows)
 
@@ -368,6 +413,14 @@ async def run_unified_gemini_committee(
 ) -> tuple[UnifiedCommitteeOutput, str]:
     client = genai.Client(api_key=api_key)
 
+    # Strip bulky chain_table before sending to LLM so context stays crisp
+    slim_fno = {k: v for k, v in fno_context.items() if k != "live_option_ltps"}
+    if "indices" in slim_fno:
+        slim_fno["indices"] = {
+            idx: {ik: iv for ik, iv in idata.items() if ik != "chain_table"}
+            for idx, idata in slim_fno["indices"].items()
+        }
+
     prompt = f"""
     You are AG4 (Chief Multi-Asset Trading Auditor) managing a ₹2,00,000 NSE Intraday Desk split into:
     - Book A (₹1,00,000 Equity MIS): Allowed = {allow_eq}
@@ -379,15 +432,15 @@ async def run_unified_gemini_committee(
     EQUITY CANDIDATES (Book A):
     {json.dumps(eq_candidates, indent=2)}
 
-    INDEX F&O CONTEXT & LIVE OPTION CHAINS (Book B):
-    {json.dumps(fno_context, indent=2)}
+    INDEX F&O CONTEXT & OPTION GREEKS (Book B):
+    {json.dumps(slim_fno, indent=2)}
 
     Rules:
     1. For Book A (Equity): Approve up to 2 highest-conviction BUY setups (R:R >= 1:1.6, conviction >= 60). Veto NEGATIVE_RISK news or RSI > 78.
     2. For Book B (Index F&O): Approve up to 2 NIFTY or BANKNIFTY setups (conviction >= 65).
-       - If spot > ema9 > ema20 and RSI 52-70: select Bullish CE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bull_call_spread).
-       - If spot < ema9 < ema20 and RSI 30-48: select Bearish PE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bear_put_spread).
-       - Set entry_premium = exact ltp/net_debit from the F&O context, sl_premium = entry_premium * 0.75 (-25% SL), target_premium = entry_premium * 1.45 (+45% target).
+       - If spot > ema9 > ema20 and RSI 50-72: select Bullish CE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bull_call_spread).
+       - If spot < ema9 < ema20 and RSI 28-50: select Bearish PE (SINGLE_LEG_BUY if VIX < 17 and naked_fno_allowed, else DEBIT_SPREAD using bear_put_spread).
+       - Set entry_premium = exact ltp/net_debit from the F&O context, sl_premium = entry_premium * 0.78 (-22% SL), target_premium = entry_premium * 1.45 (+45% target).
     """
 
     models_to_try = list(CANDIDATE_MODELS)
@@ -615,12 +668,12 @@ async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_of
             log_agent_msg(msg_ws, cycle_id, "AG5_EQUITY", "TERMINAL", "BUY_EXECUTED",
                           f"[EQUITY] BUY {qty} x {t.symbol} @ ₹{t.entry_price} | SL: ₹{t.stop_loss} | Target: ₹{t.target_price}", t.model_dump())
 
-    # 6B. Execute Book B (Index F&O) Orders
+    # 6B. Execute Book B (Index F&O) Orders — calibrated for 1-lot NIFTY/BANKNIFTY execution
     fno_exec_count = 0
-    fno_risk_budget = 1000.0 if locked_floor < COMBINED_PROFIT_FLOOR else max(0.0, (combined_today_pnl - locked_floor) * 0.35)
+    fno_risk_budget = 2200.0 if locked_floor < COMBINED_PROFIT_FLOOR else max(0.0, (combined_today_pnl - locked_floor) * 0.40)
     fno_max_capital_per_trade = fno_cash / MAX_FNO_POSITIONS
 
-    if allow_fno and fno_risk_budget >= 300.0:
+    if allow_fno and fno_risk_budget >= 400.0:
         for f in decision_out.fno_trades:
             if f.action != "BUY" or f.conviction < 65 or f.contract_symbol in open_fno_symbols or len(open_fno_symbols) >= MAX_FNO_POSITIONS:
                 continue
@@ -636,8 +689,7 @@ async def run_unified_cycle(gemini_api_key: str, gcp_json: dict, force_square_of
             lots_by_capital = int(fno_max_capital_per_trade / max(cost_per_lot, 1.0))
             lots = min(lots_by_risk, lots_by_capital)
 
-            # Allow at least 1 lot if total contract premium cost fits within ₹45,000
-            if lots <= 0 and cost_per_lot <= 45000.0 and risk_per_lot <= 1800.0:
+            if lots <= 0 and cost_per_lot <= 45000.0 and risk_per_lot <= 2600.0:
                 lots = 1
             if lots <= 0:
                 continue
